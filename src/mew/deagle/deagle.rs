@@ -7,6 +7,7 @@ use {
     pump_swap_types::events::{BuyEvent, SellEvent, CreatePoolEvent},
     crate::mew::sol_hook::pump_swap::{PUMP_SWAP_ID, PumpSwap, PumpSwapEvent},
     std::collections::HashMap,
+    serde_json::json,
     sqlx::types::Json,
     std::cmp::Ordering,
     crate::{log, warn}
@@ -21,6 +22,20 @@ pub enum Source {
     Dip,
     Digged,
     DevBestFriend
+}
+
+impl Source {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Source::VolCreators => "vol_creators",
+            Source::Deagle => "deagle",
+            Source::GrandChillers => "grand_chillers",
+            Source::Twitter => "twitter",
+            Source::Dip => "dip",
+            Source::Digged => "digged",
+            Source::DevBestFriend => "dev_best_friend",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +124,23 @@ pub struct AlgoConfig {
     pub min_mints: i64,
     pub min_deagle_sol: Option<f64>,
     pub grand_chillers: Option<GrandChillersConfig>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CandidateObservation {
+    pub creator: String,
+    pub source_label: String,
+    pub score_components: serde_json::Value,
+    pub score_total: f64,
+    pub cohort_size: usize,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CandidateSelectionReport {
+    pub creators: Vec<(String, Source)>,
+    pub observations: Vec<CandidateObservation>,
+    pub source_counts: HashMap<String, usize>,
 }
 
 impl Deagle {
@@ -239,6 +271,13 @@ impl Deagle {
         &self, 
         config: AlgoConfig
     ) -> anyhow::Result<Vec<(String, Source)>> {
+        Ok(self.algo_choose_creators_report(config).await?.creators)
+    }
+
+    pub async fn algo_choose_creators_report(
+        &self,
+        config: AlgoConfig,
+    ) -> anyhow::Result<CandidateSelectionReport> {
         let limit = config.limit;
         let min_mints = config.min_mints;
         let min_deagle_sol = config.min_deagle_sol.unwrap_or(0.0);
@@ -252,10 +291,30 @@ impl Deagle {
         let mut creators: Vec<AlgoCreator> = self._algo_choose_helper(limit, min_mints, min_deagle_sol, use_vc, use_deagles).await?;
         let gcv = if use_gc { self.grand_chillers(limit).await? } else { Vec::new() };
         let mut out_creators: Vec<(String, Source)> = Vec::new();
+        let mut observations: Vec<CandidateObservation> = Vec::new();
+        let mut source_counts: HashMap<String, usize> = HashMap::new();
 
         for creator in creators.iter_mut() {
             if creator.source == Source::Deagle {
                 out_creators.push((creator.creator.to_string(), Source::Deagle));
+                let deagle_amount = self
+                    .goldmine
+                    .get_deagle(&creator.creator.to_string())
+                    .await?
+                    .map(|row| row.sol_amount)
+                    .unwrap_or_default();
+                observations.push(CandidateObservation {
+                    creator: creator.creator.to_string(),
+                    source_label: Source::Deagle.label().to_string(),
+                    score_components: json!({
+                        "deagle_sol_amount": deagle_amount,
+                        "min_deagle_sol": min_deagle_sol,
+                    }),
+                    score_total: deagle_amount,
+                    cohort_size: 0,
+                    reason: "deagle_transfer_threshold".to_string(),
+                });
+                *source_counts.entry(Source::Deagle.label().to_string()).or_insert(0) += 1;
             }
             let mut buys_vec: Vec<f64> = Vec::new();
             let mut vol_vec:  Vec<f64> = Vec::new();
@@ -271,16 +330,57 @@ impl Deagle {
         
             if median_buys >= min_buys as f64 && median_volume >= min_volume {
                 out_creators.push((creator.creator.to_string(), Source::VolCreators));
+                observations.push(CandidateObservation {
+                    creator: creator.creator.to_string(),
+                    source_label: Source::VolCreators.label().to_string(),
+                    score_components: json!({
+                        "median_buys": median_buys,
+                        "median_volume": median_volume,
+                        "mint_count": creator.mints.as_ref().map(|mints| mints.len()).unwrap_or_default(),
+                        "min_buys": min_buys,
+                        "min_volume": min_volume,
+                    }),
+                    score_total: median_volume + median_buys,
+                    cohort_size: 0,
+                    reason: "volume_creator_threshold".to_string(),
+                });
+                *source_counts.entry(Source::VolCreators.label().to_string()).or_insert(0) += 1;
             }
         }
         if let Some(config) = grand_chillers {
             for chiller in gcv.iter() {
                 if chiller.median_token_high_mc >= config.min_hmc && chiller.mints >= config.min_mints && chiller.median_buys >= config.min_buys {
                     out_creators.push((chiller.creator.to_string(), Source::GrandChillers));
+                    observations.push(CandidateObservation {
+                        creator: chiller.creator.to_string(),
+                        source_label: Source::GrandChillers.label().to_string(),
+                        score_components: json!({
+                            "median_token_high_mc": chiller.median_token_high_mc,
+                            "median_buys": chiller.median_buys,
+                            "mints": chiller.mints,
+                            "min_hmc": config.min_hmc,
+                            "min_mints": config.min_mints,
+                            "min_buys": config.min_buys,
+                        }),
+                        score_total: chiller.median_token_high_mc + chiller.median_buys as f64 + chiller.mints as f64,
+                        cohort_size: 0,
+                        reason: "grand_chiller_threshold".to_string(),
+                    });
+                    *source_counts.entry(Source::GrandChillers.label().to_string()).or_insert(0) += 1;
                 }
             }
         }
-        Ok(out_creators)
+        for observation in &mut observations {
+            observation.cohort_size = source_counts
+                .get(&observation.source_label)
+                .copied()
+                .unwrap_or_default();
+        }
+        Ok(CandidateSelectionReport {
+            creators: out_creators,
+            observations,
+            source_counts,
+        })
     }
 
     pub async fn _algo_choose_helper(&self, limit: i64, min_mints: i64, min_deagle_sol: f64, use_vc: bool, use_deagles: bool) -> anyhow::Result<Vec<AlgoCreator>> {

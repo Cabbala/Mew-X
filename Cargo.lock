@@ -2585,6 +2585,7 @@ dependencies = [
  "spl-token",
  "spl-token-2022",
  "sqlx",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-tungstenite 0.27.0",

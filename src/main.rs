@@ -1,5 +1,5 @@
 use {
-    mew::{log, mew::{config::{self, get_use_grpc, get_db_url, get_use_regions}, deagle::deagle::{Deagle, DeagleConfig, Source}, snipe::handler::MewSnipe, sol_hook::{goldmine::Goldmine, pump_fun::PumpFun, pump_swap::PumpSwap, sol::SolHook, vacation::Vacation}, writing::{cc, Colors}}, warn}, solana_keypair::Keypair, std::{io::{self, StdoutLock}, sync::Arc}
+    mew::{log, mew::{config::{self, get_use_grpc, get_db_url, get_use_regions}, deagle::deagle::{Deagle, DeagleConfig, Source}, instrumentation::MewInstrumentation, snipe::handler::MewSnipe, sol_hook::{goldmine::Goldmine, pump_fun::PumpFun, pump_swap::PumpSwap, sol::SolHook, vacation::Vacation}, writing::{cc, Colors}}, warn}, solana_keypair::Keypair, std::{io::{self, StdoutLock}, sync::Arc}
 };
 
 pub const VERSION: &str = "0.1.0";
@@ -77,6 +77,9 @@ async fn main() {
     log!("Using config: {}", config.to_string_masked());
     log!("Using regions: {:?}", config::get_regions().unwrap());
     let algo_config = config::get_algo_config();
+    let snipe_config = config::get_snipe_config();
+    let strats_config = config::get_strats_config();
+    let tx_settings = config::get_tx_settings();
     log!("{:?}", algo_config);
 
     let sol = SolHook::new(rpc_url);
@@ -86,19 +89,32 @@ async fn main() {
 
     let (vacs, goldmine, deagle) = init_dbs(&sol, &mut colors, &pump_fun, &pump_swap).await;
 
-    let algo_creators = deagle.algo_choose_creators(algo_config.clone()).await.unwrap();
-    let mut deagles = 0;
-    let mut vol_creators = 0;
-    let mut grand_chillers = 0;
-    for (_, source) in &algo_creators {
-        match source {
-            Source::Deagle => deagles += 1,
-            Source::VolCreators => vol_creators += 1,
-            Source::GrandChillers => grand_chillers += 1,
-            Source::Twitter => {}
-            _ => {}
-        }
-    }
+    let instrumentation = Arc::new(MewInstrumentation::new(env!("CARGO_MANIFEST_DIR")));
+    let candidate_report = deagle.algo_choose_creators_report(algo_config.clone()).await.unwrap();
+    let algo_creators = candidate_report.creators.clone();
+    let deagles = candidate_report.source_counts.get(Source::Deagle.label()).copied().unwrap_or_default();
+    let vol_creators = candidate_report.source_counts.get(Source::VolCreators.label()).copied().unwrap_or_default();
+    let grand_chillers = candidate_report.source_counts.get(Source::GrandChillers.label()).copied().unwrap_or_default();
+
+    instrumentation.export_masked_config(
+        &config,
+        &algo_config,
+        &snipe_config,
+        &strats_config,
+        &tx_settings,
+        &candidate_report.source_counts,
+    );
+    instrumentation.export_candidate_snapshot(
+        "initial_selection",
+        &candidate_report,
+        &candidate_report
+            .observations
+            .iter()
+            .map(|observation| format!("{}::{}", observation.source_label, observation.creator))
+            .collect::<Vec<_>>(),
+        &[],
+    );
+    instrumentation.emit_creator_candidates(&candidate_report, "initial_selection", None);
 
     colors.cprint(&format!("Deagles: {}\nVolume Creators: {}\nGrand Chillers: {}\nTotal Creators: {}", deagles, vol_creators, grand_chillers, algo_creators.len()), cc::LIGHT_BLUE);
 
@@ -117,12 +133,20 @@ async fn main() {
         grpc_token.clone(), 
         algo_creators,
         algo_config,
+        instrumentation.clone(),
     );
 
     tokio::spawn(async move {
         if let Err(e) = deagle.clone().run().await {
             warn!("Deagle crashed: {e}");
         }
+    });
+
+    let shutdown_instrumentation = instrumentation.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown_instrumentation.finalize();
+        std::process::exit(0);
     });
 
     let snipe_for_refresh = snipe.clone();
@@ -160,8 +184,5 @@ async fn main() {
     });
 
     let _ = tokio::join!(snipe_handle, pump_fun_handle, pump_swap_handle);
-
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
+    instrumentation.finalize();
 }

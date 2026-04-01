@@ -20,7 +20,8 @@ pub enum Source {
     Twitter,
     Dip,
     Digged,
-    DevBestFriend
+    DevBestFriend,
+    DexterTrust,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +101,13 @@ pub struct GrandChillersConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct DexterTrustConfig {
+    pub use_dexter_trust: bool,
+    pub db_url: String,
+    pub min_trust_factor: f64,
+}
+
+#[derive(Debug, Clone)]
 pub struct AlgoConfig {
     pub limit: i64,
     pub use_vc: bool,
@@ -109,6 +117,7 @@ pub struct AlgoConfig {
     pub min_mints: i64,
     pub min_deagle_sol: Option<f64>,
     pub grand_chillers: Option<GrandChillersConfig>,
+    pub dexter_trust: Option<DexterTrustConfig>,
 }
 
 impl Deagle {
@@ -245,7 +254,7 @@ impl Deagle {
         let min_buys = config.min_buys;
         let min_volume = config.min_volume;
         let grand_chillers = config.grand_chillers;
-        let use_gc = grand_chillers.as_ref().unwrap().use_gc;
+        let use_gc = grand_chillers.as_ref().map(|gc| gc.use_gc).unwrap_or(false);
         let use_vc = config.use_vc;
         let use_deagles = config.use_deagles;
 
@@ -280,6 +289,23 @@ impl Deagle {
                 }
             }
         }
+
+        // DexterTrust: fetch high-trust creators from Dexter-v3 leaderboard DB
+        if let Some(ref dt_config) = config.dexter_trust {
+            if dt_config.use_dexter_trust {
+                match self.goldmine.get_dexter_trusted_creators(dt_config.min_trust_factor).await {
+                    Ok(trusted) => {
+                        for creator_addr in trusted {
+                            out_creators.push((creator_addr, Source::DexterTrust));
+                        }
+                    }
+                    Err(e) => {
+                        warn!("DexterTrust creator fetch failed: {e}");
+                    }
+                }
+            }
+        }
+
         Ok(out_creators)
     }
 

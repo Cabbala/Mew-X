@@ -42,8 +42,19 @@ async fn init_dbs(sol: &SolHook, colors: &mut Colors<'static>, pump_fun: &PumpFu
         }
         // `goldmine` DB is used to store token data and duplicates.
         let goldmine = Goldmine::new(sol.clone());
-        let goldmine = goldmine.initialize((db_url.clone() + "/goldmine").as_str()).await;
+        let mut goldmine = goldmine.initialize((db_url.clone() + "/goldmine").as_str()).await;
         colors.cprint("Goldmine database initialized 💰", cc::LIGHT_YELLOW);
+
+        // Connect to Dexter-v3 trust factor DB if configured
+        let algo_config_pre = config::get_algo_config();
+        if let Some(ref dt) = algo_config_pre.dexter_trust {
+            if dt.use_dexter_trust && !dt.db_url.is_empty() {
+                match goldmine.connect_dexter_db(&dt.db_url).await {
+                    Ok(_) => colors.cprint("DexterTrust database connected 🎯", cc::LIGHT_GREEN),
+                    Err(e) => colors.cprint(&format!("DexterTrust DB connection failed: {e}"), cc::RED),
+                }
+            }
+        }
 
         colors.cprint("Starting Deagle 🦅", cc::LIGHT_BLUE);
         let is_debug = config::get_deagle_debug();
@@ -90,17 +101,18 @@ async fn main() {
     let mut deagles = 0;
     let mut vol_creators = 0;
     let mut grand_chillers = 0;
+    let mut dexter_trust = 0;
     for (_, source) in &algo_creators {
         match source {
             Source::Deagle => deagles += 1,
             Source::VolCreators => vol_creators += 1,
             Source::GrandChillers => grand_chillers += 1,
-            Source::Twitter => {}
+            Source::DexterTrust => dexter_trust += 1,
             _ => {}
         }
     }
 
-    colors.cprint(&format!("Deagles: {}\nVolume Creators: {}\nGrand Chillers: {}\nTotal Creators: {}", deagles, vol_creators, grand_chillers, algo_creators.len()), cc::LIGHT_BLUE);
+    colors.cprint(&format!("Deagles: {}\nVolume Creators: {}\nGrand Chillers: {}\nDexter Trust: {}\nTotal Creators: {}", deagles, vol_creators, grand_chillers, dexter_trust, algo_creators.len()), cc::LIGHT_BLUE);
 
     if let Err(e) = deagle.clone().analyze_profits().await {
         warn!("Deagle crashed: {e}");

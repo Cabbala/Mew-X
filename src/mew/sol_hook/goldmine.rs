@@ -74,6 +74,7 @@ pub struct Dupe {
 pub struct Goldmine {
     pub sol_hook: SolHook,
     pub db_pool: Option<Pool<Postgres>>,
+    pub dexter_pool: Option<Pool<Postgres>>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -121,6 +122,7 @@ impl Goldmine {
         Self {
             sol_hook,
             db_pool: None,
+            dexter_pool: None,
         }
     }
 
@@ -521,5 +523,45 @@ impl Goldmine {
         let sql = r#"SELECT * FROM sims"#;
         let rows = sqlx::query_as::<_, Sim>(sql).fetch_all(self.db()?).await?;
         Ok(rows)
+    }
+
+    // --- DexterTrust integration ---
+
+    pub async fn connect_dexter_db(&mut self, database_url: &str) -> anyhow::Result<()> {
+        let pool = PgPoolOptions::new()
+            .max_connections(3)
+            .connect(database_url)
+            .await?;
+        self.dexter_pool = Some(pool);
+        Ok(())
+    }
+
+    fn dexter_db(&self) -> anyhow::Result<&Pool<Postgres>> {
+        match &self.dexter_pool {
+            Some(p) => Ok(p),
+            None => anyhow::bail!("Dexter trust database is not connected"),
+        }
+    }
+
+    /// Fetch high-trust creator addresses from Dexter-v3's latest leaderboard.
+    pub async fn get_dexter_trusted_creators(&self, min_trust_factor: f64) -> anyhow::Result<Vec<String>> {
+        let pool = self.dexter_db()?;
+        let sql = r#"
+            SELECT cs.creator
+            FROM phase2_creator_snapshots cs
+            WHERE cs.leaderboard_version = (
+                SELECT version FROM phase2_leaderboard_generations
+                ORDER BY generated_at DESC LIMIT 1
+            )
+            AND cs.trust_factor >= $1
+            ORDER BY cs.performance_score DESC
+        "#;
+
+        let rows: Vec<(String,)> = sqlx::query_as(sql)
+            .bind(min_trust_factor)
+            .fetch_all(pool)
+            .await?;
+
+        Ok(rows.into_iter().map(|(c,)| c).collect())
     }
 }

@@ -3,7 +3,7 @@ use dotenv::dotenv;
 use std::env;
 use crate::mew::writing::{cc};
 use serde::{Serialize, Deserialize};
-use crate::mew::deagle::deagle::{AlgoConfig, GrandChillersConfig};
+use crate::mew::deagle::deagle::{AlgoConfig, GrandChillersConfig, DexterTrustConfig};
 use crate::mew::sol_hook::sol::PriorityFeeLevel;
 
 pub struct TxSettings {
@@ -201,6 +201,16 @@ pub fn get_algo_config() -> AlgoConfig {
     } else {
         None
     };
+    let dexter_trust = if env::var("DEXTER_TRUST_DB_URL").is_ok() {
+        Some(DexterTrustConfig {
+            use_dexter_trust: env::var("ALGO_USE_DEXTER_TRUST").ok().unwrap_or_default().parse().unwrap_or(true),
+            db_url: env::var("DEXTER_TRUST_DB_URL").unwrap_or_default(),
+            min_trust_factor: env::var("DEXTER_MIN_TRUST_FACTOR").ok().unwrap_or_default().parse().unwrap_or(0.0),
+        })
+    } else {
+        None
+    };
+
     AlgoConfig {
         limit: env::var("ALGO_LIMIT").ok().unwrap_or_default().parse().unwrap_or(400),
         min_mints: env::var("ALGO_MIN_MINTS").ok().unwrap_or_default().parse().unwrap_or(1),
@@ -210,6 +220,7 @@ pub fn get_algo_config() -> AlgoConfig {
         min_buys: env::var("ALGO_MIN_BUYS").ok().unwrap_or_default().parse().unwrap_or(1),
         min_volume: env::var("ALGO_MIN_VOLUME").ok().unwrap_or_default().parse().unwrap_or(10.0),
         grand_chillers,
+        dexter_trust,
     }
 }
 

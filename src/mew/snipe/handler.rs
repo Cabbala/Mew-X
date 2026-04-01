@@ -200,12 +200,20 @@ impl MewSnipe {
 
     pub async fn refresh_creators_loop(&self) -> anyhow::Result<()> {
         let mut last_creators = self.creators.read().await.len();
+        let mut consecutive_errors = 0u32;
         loop {
             let algo_creators = match self.deagle.algo_choose_creators(self.algo_config.clone()).await {
-                Ok(creators) => creators,
+                Ok(creators) => {
+                    consecutive_errors = 0;
+                    creators
+                },
                 Err(e) => {
-                    warn!("refresh_creators_loop: {e}");
-                    return Err(anyhow::anyhow!("refresh_creators_loop: {e}"));
+                    consecutive_errors += 1;
+                    warn!("refresh_creators_loop: {e} (attempt {consecutive_errors}, keeping previous {} creators)", last_creators);
+                    // Keep previous creator list, retry after backoff
+                    let backoff = std::cmp::min(60 * consecutive_errors as u64, 300);
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                    continue;
                 }
             };
             {
@@ -480,7 +488,7 @@ impl MewSnipe {
                 highest_profit: highest_profit,
             };
 
-            self.goldmine.upsert_sim(&sim).await.unwrap();
+            if let Err(e) = self.goldmine.upsert_sim(&sim).await { warn!("upsert_sim failed: {e}"); }
         }
         Ok(())
     }
@@ -832,7 +840,7 @@ impl MewSnipe {
                 highest_profit: highest_profit,
             };
 
-            self.goldmine.upsert_sim(&sim).await.unwrap();
+            if let Err(e) = self.goldmine.upsert_sim(&sim).await { warn!("upsert_sim failed: {e}"); }
         }
         Ok(())
     }
@@ -1094,7 +1102,7 @@ impl MewSnipe {
                             let mut map = mints.write().await;
                             map.insert(create.mint, new_mint.clone());
 
-                            if goldmine.get_dupes(&name, &symbol, &uri).await.unwrap().is_some() {
+                            if goldmine.get_dupes(&name, &symbol, &uri).await.unwrap_or(None).is_some() {
                                 return;
                             }
                             // TODO: Uncomment this when we have a way to blacklist creators
@@ -1347,7 +1355,7 @@ impl MewSnipe {
                             let mut map = mints.write().await;
                             map.insert(create.mint, new_mint.clone());
 
-                            if goldmine.get_dupes(&name, &symbol, &uri).await.unwrap().is_some() {
+                            if goldmine.get_dupes(&name, &symbol, &uri).await.unwrap_or(None).is_some() {
                                 return;
                             }
                             // TODO: Uncomment this when we have a way to blacklist creators

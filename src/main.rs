@@ -148,26 +148,34 @@ async fn main() {
     });
     
     let pump_fun_handle = tokio::spawn(async move {
-        if use_grpc {
-        if let Err(e) = snipe_for_pumpfun.subscribe_grpc_pump_fun().await {
-                warn!("PumpFun snipe crashed: {e}");
+        loop {
+            if use_grpc {
+                if let Err(e) = snipe_for_pumpfun.subscribe_grpc_pump_fun().await {
+                    warn!("PumpFun snipe crashed: {e} — reconnecting in 5s");
+                }
+            } else {
+                if let Err(e) = snipe_for_pumpfun.subscribe_ws_pump_fun().await {
+                    warn!("PumpFun WS crashed: {e} — reconnecting in 5s");
+                }
             }
-        } else {
-            if let Err(e) = snipe_for_pumpfun.subscribe_ws_pump_fun().await {
-                warn!("PumpFun snipe crashed: {e}");
-            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            log!(cc::LIGHT_YELLOW, "Reconnecting PumpFun subscription...");
         }
     });
 
     let pump_swap_handle = tokio::spawn(async move {
-        if use_grpc {
-        if let Err(e) = snipe_for_pumpswap.subscribe_grpc_pump_swap().await {
-                warn!("PumpSwap snipe crashed: {e}");
+        loop {
+            if use_grpc {
+                if let Err(e) = snipe_for_pumpswap.subscribe_grpc_pump_swap().await {
+                    warn!("PumpSwap snipe crashed: {e} — reconnecting in 5s");
+                }
+            } else {
+                if let Err(e) = snipe_for_pumpswap.subscribe_ws_pump_swap().await {
+                    warn!("PumpSwap WS crashed: {e} — reconnecting in 5s");
+                }
             }
-        } else {
-            if let Err(e) = snipe_for_pumpswap.subscribe_ws_pump_swap().await {
-                warn!("PumpSwap snipe crashed: {e}");
-            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            log!(cc::LIGHT_YELLOW, "Reconnecting PumpSwap subscription...");
         }
     });
 

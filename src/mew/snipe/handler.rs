@@ -1192,7 +1192,10 @@ impl MewSnipe {
         // let buy_amount = config().buy_amount;
         let ws_url = config().ws_url.clone();
 
-        let (mut rx, _handle) = self.sol_hook.subscribe_logs_channel(&ws_url, RpcTransactionLogsFilter::Mentions(vec![Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap().to_string()]), CommitmentConfig::processed()).await.unwrap();
+        let (mut rx, _handle) = match self.sol_hook.subscribe_logs_channel(&ws_url, RpcTransactionLogsFilter::Mentions(vec![Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap().to_string()]), CommitmentConfig::processed()).await {
+            Ok(r) => r,
+            Err(e) => { anyhow::bail!("PumpFun WS subscribe failed: {e}"); }
+        };
         log!(cc::LIGHT_WHITE, "Subscribed to Pump.fun using WS");
 
         let strats_config = get_strats_config();
@@ -1592,7 +1595,10 @@ impl MewSnipe {
         // let buy_amount = config().buy_amount;
         let ws_url = config().ws_url.clone();
 
-        let (mut rx, _handle) = self.sol_hook.subscribe_logs_channel(&ws_url, RpcTransactionLogsFilter::Mentions(vec![Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").unwrap().to_string()]), CommitmentConfig::processed()).await.unwrap();
+        let (mut rx, _handle) = match self.sol_hook.subscribe_logs_channel(&ws_url, RpcTransactionLogsFilter::Mentions(vec![Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").unwrap().to_string()]), CommitmentConfig::processed()).await {
+            Ok(r) => r,
+            Err(e) => { anyhow::bail!("PumpSwap WS subscribe failed: {e}"); }
+        };
         log!(cc::LIGHT_WHITE, "Subscribed to PumpSwap using WS");
 
         while let Some(msg) = rx.recv().await {

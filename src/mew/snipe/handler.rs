@@ -106,6 +106,13 @@ pub fn pct_change(entry: f64, now: f64) -> f64 {
     (now / entry - 1.0) * 100.0
 }
 
+fn matches_tracked_creator(candidate: &str, source: &Source, creator: &str, user: &str) -> bool {
+    match source {
+        Source::DexterTrust => candidate == user,
+        _ => candidate == creator,
+    }
+}
+
 static TWITTER_SCORE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"Twitter Score is (\d+)").unwrap());
 
@@ -1067,7 +1074,10 @@ impl MewSnipe {
                             let name = create.name.clone();
                             let symbol = create.symbol.clone();
                             let uri = create.uri.clone();
+                            let user = create.user;
                             let creator = create.creator;
+                            let user_str = user.to_string();
+                            let creator_str = creator.to_string();
                             let created_time = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .expect("Time error.");
@@ -1110,7 +1120,10 @@ impl MewSnipe {
                             //     return;
                             // }
 
-                            if let Some((_, creator_source)) = creators.iter().find(|(c, _)| c == &creator.to_string()) {
+                            if let Some((_, creator_source)) = creators
+                                .iter()
+                                .find(|(c, source)| matches_tracked_creator(c, source, &creator_str, &user_str))
+                            {
                                 log!(
                                     cc::LIGHT_WHITE,
                                     "Mew mint {:?} from creator {:?}\n Source: {:?}",
@@ -1323,7 +1336,10 @@ impl MewSnipe {
                             let name = create.name.clone();
                             let symbol = create.symbol.clone();
                             let uri = create.uri.clone();
+                            let user = create.user;
                             let creator = create.creator;
+                            let user_str = user.to_string();
+                            let creator_str = creator.to_string();
                             let created_time = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .expect("Time error.");
@@ -1366,7 +1382,10 @@ impl MewSnipe {
                             //     return;
                             // }
 
-                            if let Some((_, creator_source)) = creators.iter().find(|(c, _)| c == &creator.to_string()) {
+                            if let Some((_, creator_source)) = creators
+                                .iter()
+                                .find(|(c, source)| matches_tracked_creator(c, source, &creator_str, &user_str))
+                            {
                                 log!(
                                     cc::LIGHT_WHITE,
                                     "Mew mint {:?} from creator {:?}\n Source: {:?}",

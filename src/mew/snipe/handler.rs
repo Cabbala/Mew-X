@@ -309,21 +309,24 @@ impl MewSnipe {
         let take_profit = if is_mtd {mtd_take_profit} else {take_profit};
         tokio::time::sleep(std::time::Duration::from_millis(wait_time_creator_buy)).await;
 
-        // check creator hold percent (aka 'chp')
-        if snipe_config.use_chp && !disable_checks {
+        // pre-buy filters
+        if !disable_checks && (snipe_config.use_chp || snipe_config.use_tiz) {
             log!(cc::LIGHT_WHITE, "Reading mint: {:?}", mint);
             let mint = self.mints.read().await.get(&Pubkey::from_str(mint.clone().as_str()).unwrap()).unwrap().clone();
-            log!(cc::LIGHT_WHITE, "Creator token amount: {:?}", mint.creator_token_amount);
-            let creator_hold_percent = mint.creator_token_amount / TOTAL_SUPPLY as f64;
 
-            if mint.txns_in_zero >= tiz_lower && mint.txns_in_zero <= tiz_upper {
+            if snipe_config.use_tiz && mint.txns_in_zero >= tiz_lower && mint.txns_in_zero <= tiz_upper {
                 warn!("Skipping sim session because txns in slot zero aren't in range: {:?} | Possibly bundled: {}", mint.mint, mint.txns_in_zero);
                 return Ok(());
             }
 
-            if creator_hold_percent > chp_lower && creator_hold_percent < chp_upper {
-                warn!("Skipping sim session because creator hold percent is out of range: {:?}", creator_hold_percent);
-                return Ok(());
+            if snipe_config.use_chp {
+                log!(cc::LIGHT_WHITE, "Creator token amount: {:?}", mint.creator_token_amount);
+                let creator_hold_percent = mint.creator_token_amount / TOTAL_SUPPLY as f64;
+
+                if creator_hold_percent > chp_lower && creator_hold_percent < chp_upper {
+                    warn!("Skipping trade session because creator hold percent is out of range: {:?}", creator_hold_percent);
+                    return Ok(());
+                }
             }
         }
 
@@ -690,21 +693,24 @@ impl MewSnipe {
         let take_profit = if is_mtd {mtd_take_profit} else {take_profit};
         tokio::time::sleep(std::time::Duration::from_millis(wait_time_creator_buy)).await;
 
-        // check creator hold percent (aka 'chp')
-        if snipe_config.use_chp && !disable_checks {
+        // pre-buy filters
+        if !disable_checks && (snipe_config.use_chp || snipe_config.use_tiz) {
             log!(cc::LIGHT_WHITE, "Reading mint: {:?}", mint);
             let mint = self.mints.read().await.get(&Pubkey::from_str(mint.clone().as_str()).unwrap()).unwrap().clone();
-            log!(cc::LIGHT_WHITE, "Creator token amount: {:?}", mint.creator_token_amount);
-            let creator_hold_percent = mint.creator_token_amount / TOTAL_SUPPLY as f64;
 
-            if mint.txns_in_zero >= tiz_lower && mint.txns_in_zero <= tiz_upper {
-                warn!("Skipping sim session because txns in slot zero aren't in range: {:?} | Possibly bundled: {}", mint.mint, mint.txns_in_zero);
+            if snipe_config.use_tiz && mint.txns_in_zero >= tiz_lower && mint.txns_in_zero <= tiz_upper {
+                warn!("Skipping trade session because txns in slot zero aren't in range: {:?} | Possibly bundled: {}", mint.mint, mint.txns_in_zero);
                 return Ok(());
             }
 
-            if creator_hold_percent > chp_lower && creator_hold_percent < chp_upper {
-                warn!("Skipping sim session because creator hold percent is out of range: {:?}", creator_hold_percent);
-                return Ok(());
+            if snipe_config.use_chp {
+                log!(cc::LIGHT_WHITE, "Creator token amount: {:?}", mint.creator_token_amount);
+                let creator_hold_percent = mint.creator_token_amount / TOTAL_SUPPLY as f64;
+
+                if creator_hold_percent > chp_lower && creator_hold_percent < chp_upper {
+                    warn!("Skipping trade session because creator hold percent is out of range: {:?}", creator_hold_percent);
+                    return Ok(());
+                }
             }
         }
 

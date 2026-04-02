@@ -336,21 +336,40 @@ impl MewSnipe {
         mint.buys += 1;
         mint.volume += buy_amount;
         let price = mint.price;
-        let tok_amount = self.pump_fun.lamports_to_tokens(buy_amount * 1e9, price);
-        log!(cc::LIGHT_WHITE, "Buying {} with {} in return for {} tokens", mint.mint, buy_amount, tok_amount as f64 / 1e6);
-
         let bc = match mint.is_migrated {
             false => Pools { pump_fun: Some(self.pump_fun.fetch_state(&mint.bonding_curve).await.unwrap()), pump_swap: None },
             true => Pools { pump_fun: None, pump_swap: Some(self.pump_swap.fetch_state(&mint.bonding_curve).await.unwrap()) },
         };
 
+        let mut tok_amount = self.pump_fun.lamports_to_tokens(buy_amount * 1e9, price);
         let mut buy_price = price;
         if let Some(bc) = bc.pump_fun {
-            let (vsr, vtr) = (bc.virtual_sol_reserves as f64 / 1e9, bc.virtual_token_reserves as f64 / 1e6);
-            let (vsr, vtr) = (vsr + buy_amount, vtr + tok_amount as f64 / 1e6);
-            mint.price = vsr / vtr;
-            buy_price = vsr / vtr;
+            let gross_sol_lamports = (buy_amount * 1e9).round() as u128;
+            let fee_bps = 125u128;
+            let net_sol_lamports = (gross_sol_lamports * 10_000) / (10_000 + fee_bps);
+
+            if net_sol_lamports > 1 {
+                let vsr_raw = bc.virtual_sol_reserves as u128;
+                let vtr_raw = bc.virtual_token_reserves as u128;
+                let tokens_out = ((net_sol_lamports - 1) * vtr_raw) / (vsr_raw + net_sol_lamports - 1);
+
+                if tokens_out > 0 {
+                    tok_amount = tokens_out as u64;
+                    let new_vsr_raw = vsr_raw + net_sol_lamports;
+                    let new_vtr_raw = vtr_raw.saturating_sub(tokens_out);
+
+                    if new_vtr_raw > 0 {
+                        let vsr = new_vsr_raw as f64 / 1e9;
+                        let vtr = new_vtr_raw as f64 / 1e6;
+                        mint.price = vsr / vtr;
+                        buy_price = mint.price;
+                    }
+                }
+            }
+            log!(cc::LIGHT_WHITE, "Buying {} with {} in return for {} tokens", mint.mint, buy_amount, tok_amount as f64 / 1e6);
             log!(cc::LIGHT_WHITE, "After buying, price: {}", mint.price);
+        } else {
+            log!(cc::LIGHT_WHITE, "Buying {} with {} in return for {} tokens", mint.mint, buy_amount, tok_amount as f64 / 1e6);
         }
 
         // throw everything above tiz_lower and below tiz_upper txns in zero

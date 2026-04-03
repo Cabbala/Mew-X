@@ -1,5 +1,5 @@
 use {
-    mew::{log, mew::{config::{self, get_use_grpc, get_db_url, get_use_regions}, deagle::deagle::{Deagle, DeagleConfig, Source}, snipe::handler::MewSnipe, sol_hook::{goldmine::Goldmine, pump_fun::PumpFun, pump_swap::PumpSwap, sol::SolHook, vacation::Vacation}, writing::{cc, Colors}}, warn}, solana_keypair::Keypair, std::{io::{self, StdoutLock}, sync::Arc}
+    mew::{log, mew::{config::{self, get_use_grpc, get_db_url, get_use_regions}, deagle::deagle::{AlgoConfig, Deagle, DeagleConfig, Source}, snipe::handler::MewSnipe, sol_hook::{goldmine::Goldmine, pump_fun::PumpFun, pump_swap::PumpSwap, sol::SolHook, vacation::Vacation}, writing::{cc, Colors}}, warn}, solana_keypair::Keypair, std::{io::{self, StdoutLock}, sync::Arc, time::Duration}
 };
 
 pub const VERSION: &str = "0.1.0";
@@ -74,6 +74,29 @@ async fn init_dbs(sol: &SolHook, colors: &mut Colors<'static>, pump_fun: &PumpFu
         (vacs, goldmine, deagle)
 }
 
+async fn load_initial_creators(deagle: &Arc<Deagle>, algo_config: AlgoConfig) -> Vec<(String, Source)> {
+    let mut attempt = 0u32;
+    loop {
+        match deagle.algo_choose_creators(algo_config.clone()).await {
+            Ok(creators) if creators.is_empty() => {
+                attempt += 1;
+                let backoff = std::cmp::min(5 * attempt as u64, 60);
+                warn!(
+                    "Initial creator load returned 0 creators (attempt {attempt}); retrying in {backoff}s"
+                );
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+            }
+            Ok(creators) => return creators,
+            Err(e) => {
+                attempt += 1;
+                let backoff = std::cmp::min(5 * attempt as u64, 60);
+                warn!("Initial creator load failed: {e} (attempt {attempt}); retrying in {backoff}s");
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let lock: StdoutLock<'static> = io::stdout().lock();
@@ -97,7 +120,7 @@ async fn main() {
 
     let (vacs, goldmine, deagle) = init_dbs(&sol, &mut colors, &pump_fun, &pump_swap).await;
 
-    let algo_creators = deagle.algo_choose_creators(algo_config.clone()).await.unwrap();
+    let algo_creators = load_initial_creators(&deagle, algo_config.clone()).await;
     let mut deagles = 0;
     let mut vol_creators = 0;
     let mut grand_chillers = 0;

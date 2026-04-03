@@ -293,15 +293,13 @@ impl Deagle {
         // DexterTrust: fetch high-trust creators from Dexter-v3 leaderboard DB
         if let Some(ref dt_config) = config.dexter_trust {
             if dt_config.use_dexter_trust {
-                match self.goldmine.get_dexter_trusted_creators(dt_config.min_trust_factor).await {
-                    Ok(trusted) => {
-                        for creator_addr in trusted {
-                            out_creators.push((creator_addr, Source::DexterTrust));
-                        }
-                    }
-                    Err(e) => {
-                        warn!("DexterTrust creator fetch failed: {e}");
-                    }
+                let trusted = self
+                    .goldmine
+                    .get_dexter_trusted_creators(dt_config.min_trust_factor)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("DexterTrust creator fetch failed: {e}"))?;
+                for creator_addr in trusted {
+                    out_creators.push((creator_addr, Source::DexterTrust));
                 }
             }
         }

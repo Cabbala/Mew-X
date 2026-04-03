@@ -12,7 +12,7 @@ use {
     solana_commitment_config::CommitmentConfig, solana_keypair::Keypair, solana_message::{v0::Message as V0Message, VersionedMessage}, 
     solana_program::{hash::Hash, instruction::Instruction, nonce::{state::Versions as NonceVersions, State}, pubkey::Pubkey, system_instruction}, 
     solana_pubsub_client::nonblocking::pubsub_client::PubsubClient, solana_rpc_client_types::{config::{RpcTransactionLogsConfig, RpcTransactionLogsFilter}, response::RpcLogsResponse}, solana_signature::Signature, 
-    solana_signer::Signer, solana_transaction::versioned::VersionedTransaction, solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding}, std::{collections::{HashMap, HashSet}, str::FromStr, sync::Arc, time::{Duration, Instant}}, tokio::sync::mpsc::{self, Receiver}, tokio_stream::{Stream, StreamExt}, tonic::Status, yellowstone_grpc_client::{GeyserGrpcBuilder, GeyserGrpcClient, Interceptor, InterceptorXToken}, yellowstone_grpc_proto::geyser::{
+    solana_signer::Signer, solana_transaction::versioned::VersionedTransaction, solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding}, std::{collections::{HashMap, HashSet}, str::FromStr, sync::Arc, time::{Duration, Instant}}, tokio::sync::{mpsc::{self, Receiver}, oneshot}, tokio_stream::{Stream, StreamExt}, tonic::Status, yellowstone_grpc_client::{GeyserGrpcBuilder, GeyserGrpcClient, Interceptor, InterceptorXToken}, yellowstone_grpc_proto::geyser::{
         CommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts, SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions, SubscribeUpdate
     }, 
     spl_token::state::Mint as SplMint,
@@ -138,18 +138,28 @@ impl SolHook {
     ) -> anyhow::Result<(Receiver<RpcLogsResponse>, tokio::task::JoinHandle<()>)> {
         let ws = ws_url.to_string();
         let (tx, rx) = mpsc::channel::<RpcLogsResponse>(1024);
+        let (ready_tx, ready_rx) = oneshot::channel::<anyhow::Result<()>>();
 
         let handle = tokio::spawn(async move {
             let client = match PubsubClient::new(&ws).await {
-                Ok(c) => c,
-                Err(e) => { warn!("ws connect failed: {e}"); return; }
+                Ok(client) => client,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(anyhow::anyhow!("ws connect failed: {e}")));
+                    return;
+                }
             };
             let cfg = RpcTransactionLogsConfig {
                 commitment: Some(commitment),
             };
             let (mut stream, _unsub) = match client.logs_subscribe(filter, cfg).await {
-                Ok(p) => p,
-                Err(e) => { warn!("subscribe failed: {e}"); return; }
+                Ok(subscription) => {
+                    let _ = ready_tx.send(Ok(()));
+                    subscription
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(anyhow::anyhow!("subscribe failed: {e}")));
+                    return;
+                }
             };
 
             while let Some(msg) = stream.next().await {
@@ -158,7 +168,12 @@ impl SolHook {
                     return;
                 }
             }
+            warn!("WS stream ended");
         });
+
+        ready_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("subscription task exited before initialization"))??;
 
         Ok((rx, handle))
     }   
@@ -169,20 +184,39 @@ impl SolHook {
     ) -> anyhow::Result<(Receiver<SlotInfo>, tokio::task::JoinHandle<()>)> {
         let ws = ws_url.to_string();
         let (tx, rx) = mpsc::channel::<SlotInfo>(1024);
+        let (ready_tx, ready_rx) = oneshot::channel::<anyhow::Result<()>>();
 
         let handle = tokio::spawn(async move {
             let client = match PubsubClient::new(&ws).await {
                 Ok(c) => c,
-                Err(e) => { warn!("ws connect failed: {e}"); return; }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(anyhow::anyhow!("ws connect failed: {e}")));
+                    return;
+                }
             };
             let (mut stream, _unsub) = match client.slot_subscribe().await {
-                Ok(p) => p,
-                Err(e) => { warn!("subscribe failed: {e}"); return; }
+                Ok(p) => {
+                    let _ = ready_tx.send(Ok(()));
+                    p
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(anyhow::anyhow!("subscribe failed: {e}")));
+                    return;
+                }
             };
             while let Some(msg) = stream.next().await {
-                let _ = tx.send(msg).await;
+                if let Err(e) = tx.send(msg).await {
+                    warn!("send failed: {e}");
+                    return;
+                }
             }
+            warn!("WS stream ended");
         });
+
+        ready_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("subscription task exited before initialization"))??;
+
         Ok((rx, handle))
     }
     

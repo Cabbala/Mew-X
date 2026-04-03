@@ -182,7 +182,7 @@ async fn main() {
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            log!(cc::LIGHT_YELLOW, "Reconnecting PumpFun subscription...");
+            warn!("Reconnecting PumpFun subscription...");
         }
     });
 
@@ -198,7 +198,7 @@ async fn main() {
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            log!(cc::LIGHT_YELLOW, "Reconnecting PumpSwap subscription...");
+            warn!("Reconnecting PumpSwap subscription...");
         }
     });
 

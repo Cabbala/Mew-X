@@ -1,36 +1,61 @@
-use std::time::{Instant};
+use std::time::Instant;
 
 use crate::{log, warn};
 
+use once_cell::sync::Lazy;
+use regex::Regex;
+use reqwest::{Client, header};
 #[allow(unused_imports)]
 use {
-    crate::mew::{config::{config, Config, get_snipe_config, StratsConfig, get_strats_config, get_mode, get_use_regions, get_tx_settings, get_nonce_account, get_max_tokens_at_once}, deagle::deagle::{AlgoConfig, Deagle, Source}, sol_hook::{pump_fun::{PumpFun, PumpFunEvent, TOTAL_SUPPLY, BondingCurveAccount}, pump_swap::{PumpSwap, PumpSwapEvent}, goldmine::{Goldmine, Dupe, Sim}, sol::{SolHook, SYSTEM_PROGRAM, WSOL_MINT}}, writing::{cc, Colors}, sol_hook::vacation::Vacation},
-    pump_fun_types::events::{CreateEvent, TradeEvent},
-    pump_swap_types::events::{BuyEvent, CreatePoolEvent, SellEvent},
-    solana_keypair::Keypair,
-    solana_program::pubkey::{self, Pubkey}, tokio::stream,
-    std::{collections::HashMap, str::FromStr},
-    yellowstone_grpc_proto::prelude::{TransactionStatusMeta, SubscribeUpdateTransactionInfo},
-    yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof,
-    tokio_stream::StreamExt,
-    std::io::{self, Write},
-    sqlx::types::Json,
-    std::{sync::Arc},
-    tokio::sync::RwLock,
-    ringbuffer::{AllocRingBuffer, RingBuffer},
+    crate::mew::swqos::{
+        blox::{BLOX_ENDPOINTS, Bloxroute},
+        helius::{HELIUS_SENDER_ENDPOINTS, HeliusSender},
+        jito::{JitoClient, get_jito_clients},
+        nextblock::{NB_ENDPOINTS, NextBlock},
+        temporal::{TEMPORAL_HTTP_ENDPOINTS, TemporalSender},
+        zero_slot::{ZERO_SLOT_ENDPOINTS, ZeroSlot},
+    },
+    crate::mew::{
+        config::{
+            Config, StratsConfig, config, get_max_tokens_at_once, get_mode, get_nonce_account,
+            get_snipe_config, get_strats_config, get_tx_settings, get_use_regions,
+        },
+        deagle::deagle::{AlgoConfig, Deagle, Source},
+        sol_hook::vacation::Vacation,
+        sol_hook::{
+            goldmine::{Dupe, Goldmine, Sim},
+            pump_fun::{BondingCurveAccount, PumpFun, PumpFunEvent, TOTAL_SUPPLY},
+            pump_swap::{PumpSwap, PumpSwapEvent},
+            sol::{SYSTEM_PROGRAM, SolHook, WSOL_MINT},
+        },
+        writing::{Colors, cc},
+    },
     chrono::Utc,
     dashmap::DashMap,
     dashmap::mapref::entry::Entry,
+    pump_fun_types::events::{CreateEvent, TradeEvent},
+    pump_swap_types::events::{BuyEvent, CreatePoolEvent, SellEvent},
     pump_swap_types::state::Pool,
-    solana_program::instruction::Instruction,
-    crate::mew::swqos::{blox::{Bloxroute, BLOX_ENDPOINTS}, jito::{JitoClient, get_jito_clients}, nextblock::{NextBlock, NB_ENDPOINTS}, temporal::{TemporalSender, TEMPORAL_HTTP_ENDPOINTS}, zero_slot::{ZeroSlot, ZERO_SLOT_ENDPOINTS}, helius::{HeliusSender, HELIUS_SENDER_ENDPOINTS}},
-    solana_signature::Signature,
-    solana_rpc_client_types::config::RpcTransactionLogsFilter,
+    ringbuffer::{AllocRingBuffer, RingBuffer},
     solana_commitment_config::CommitmentConfig,
+    solana_keypair::Keypair,
+    solana_program::instruction::Instruction,
+    solana_program::pubkey::{self, Pubkey},
+    solana_rpc_client_types::config::RpcTransactionLogsFilter,
+    solana_signature::Signature,
+    sqlx::types::Json,
+    std::io::{self, Write},
+    std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    std::{collections::HashMap, str::FromStr},
+    tokio::stream,
+    tokio::sync::RwLock,
+    tokio_stream::StreamExt,
+    yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof,
+    yellowstone_grpc_proto::prelude::{SubscribeUpdateTransactionInfo, TransactionStatusMeta},
 };
-use once_cell::sync::Lazy;
-use regex::Regex;
-use reqwest::{header, Client};
 
 #[derive(Debug, Clone)]
 pub enum Market {
@@ -42,6 +67,7 @@ pub enum Market {
 pub struct Holdings {
     pub pool: Pubkey,
     pub buy_price: Option<f64>,
+    pub last_seen_at: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,6 +91,7 @@ pub struct MewMint {
     pub volume_in_n: f64,
     pub first_seen_slot: u64,
     pub last_seen_slot: u64,
+    pub last_seen_at: f64,
     pub is_migrated: bool,
     pub created_time: f64,
 }
@@ -82,6 +109,7 @@ pub struct MewSnipe {
     pub creators: Arc<RwLock<Vec<(String, Source)>>>,
     pub mints: Arc<RwLock<HashMap<Pubkey, MewMint>>>,
     pub algo_config: AlgoConfig,
+    last_cleanup_at: Arc<AtomicU64>,
     holdings: Arc<DashMap<Pubkey, Holdings>>,
 }
 
@@ -113,23 +141,26 @@ fn matches_tracked_creator(candidate: &str, source: &Source, creator: &str, user
     }
 }
 
-static TWITTER_SCORE_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"Twitter Score is (\d+)").unwrap());
+static TWITTER_SCORE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"Twitter Score is (\d+)").unwrap());
 
 pub fn sanitize_twitter_input(raw: &str) -> Option<String> {
-    static PURE_HANDLE_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"^[A-Za-z0-9_]{1,15}$").unwrap());
+    static PURE_HANDLE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[A-Za-z0-9_]{1,15}$").unwrap());
 
     static HANDLE_FROM_URL: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"(?i)^(?:https?://)?(?:www\.)?(?:x\.com|twitter\.com)/([A-Za-z0-9_]{1,15})(?:/.*)?$")
-            .unwrap()
+        Regex::new(
+            r"(?i)^(?:https?://)?(?:www\.)?(?:x\.com|twitter\.com)/([A-Za-z0-9_]{1,15})(?:/.*)?$",
+        )
+        .unwrap()
     });
 
     let s = raw.trim();
 
-    if s.to_ascii_lowercase().contains("/i/communities") || s.to_ascii_lowercase().contains("/i/spaces") 
-    || s.to_ascii_lowercase().contains("/i/topics") || s.to_ascii_lowercase().contains("/status") 
-    || s.to_ascii_lowercase().contains("/intent") {
+    if s.to_ascii_lowercase().contains("/i/communities")
+        || s.to_ascii_lowercase().contains("/i/spaces")
+        || s.to_ascii_lowercase().contains("/i/topics")
+        || s.to_ascii_lowercase().contains("/status")
+        || s.to_ascii_lowercase().contains("/intent")
+    {
         return None; // drop communities entirely
     }
     if let Some(cap) = HANDLE_FROM_URL.captures(s) {
@@ -160,9 +191,7 @@ pub async fn fetch_twitter_score(client: &Client, twitter: &str) -> i32 {
                 .and_then(|c| c.get(1))
                 .and_then(|m| m.as_str().parse::<i32>().ok())
                 .unwrap_or(0),
-            _ => {
-                0
-            },
+            _ => 0,
         },
         _ => 0,
     }
@@ -175,6 +204,9 @@ pub fn timestamp_now() -> f64 {
     let ts: f64 = time.as_secs() as f64 + f64::from(time.subsec_nanos()) * 1e-9;
     ts
 }
+
+const STALE_STATE_TTL_SECS: f64 = 10.0 * 60.0;
+const STALE_STATE_CLEANUP_INTERVAL_SECS: u64 = 60;
 
 impl MewSnipe {
     pub fn new(
@@ -201,7 +233,87 @@ impl MewSnipe {
             creators: Arc::new(RwLock::new(creators)),
             mints: Arc::new(RwLock::new(HashMap::new())),
             algo_config: algo_config,
+            last_cleanup_at: Arc::new(AtomicU64::new(0)),
             holdings: Arc::new(DashMap::new()),
+        }
+    }
+
+    async fn tracked_mint(&self, mint: &Pubkey, context: &str) -> Option<MewMint> {
+        let map = self.mints.read().await;
+        match map.get(mint) {
+            Some(m) => Some(m.clone()),
+            None => {
+                warn!("{context}: mint not tracked: {:?}", mint);
+                None
+            }
+        }
+    }
+
+    async fn tracked_mint_from_str(&self, mint: &str, context: &str) -> Option<MewMint> {
+        let mint = match Pubkey::from_str(mint) {
+            Ok(mint) => mint,
+            Err(e) => {
+                warn!("{context}: invalid mint {mint}: {e}");
+                return None;
+            }
+        };
+        self.tracked_mint(&mint, context).await
+    }
+
+    fn touch_holding(&self, mint: Pubkey, buy_price: Option<f64>) {
+        if let Some(mut holding) = self.holdings.get_mut(&mint) {
+            holding.last_seen_at = timestamp_now();
+            if let Some(buy_price) = buy_price {
+                holding.buy_price = Some(buy_price);
+            }
+        }
+    }
+
+    async fn cleanup_stale_state_if_due(&self) {
+        let now = timestamp_now();
+        let now_secs = now as u64;
+        let last_cleanup = self.last_cleanup_at.load(Ordering::Relaxed);
+        if now_secs.saturating_sub(last_cleanup) < STALE_STATE_CLEANUP_INTERVAL_SECS {
+            return;
+        }
+        if self
+            .last_cleanup_at
+            .compare_exchange(last_cleanup, now_secs, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let cutoff = now - STALE_STATE_TTL_SECS;
+        let removed_mints = {
+            let holdings = Arc::clone(&self.holdings);
+            let mut map = self.mints.write().await;
+            let before = map.len();
+            map.retain(|mint_key, mint| {
+                // Never evict a mint while an active session still tracks it.
+                mint.last_seen_at >= cutoff || holdings.contains_key(mint_key)
+            });
+            before.saturating_sub(map.len())
+        };
+
+        let stale_holdings = self
+            .holdings
+            .iter()
+            .filter(|holding| holding.value().last_seen_at < cutoff)
+            .map(|holding| *holding.key())
+            .collect::<Vec<_>>();
+        let removed_holdings = stale_holdings.len();
+        for mint in stale_holdings {
+            self.holdings.remove(&mint);
+        }
+
+        if removed_mints > 0 || removed_holdings > 0 {
+            log!(
+                cc::LIGHT_WHITE,
+                "Cleaned stale state: {} mints, {} holdings",
+                removed_mints,
+                removed_holdings
+            );
         }
     }
 
@@ -209,14 +321,21 @@ impl MewSnipe {
         let mut last_creators = self.creators.read().await.len();
         let mut consecutive_errors = 0u32;
         loop {
-            let algo_creators = match self.deagle.algo_choose_creators(self.algo_config.clone()).await {
+            let algo_creators = match self
+                .deagle
+                .algo_choose_creators(self.algo_config.clone())
+                .await
+            {
                 Ok(creators) => {
                     consecutive_errors = 0;
                     creators
-                },
+                }
                 Err(e) => {
                     consecutive_errors += 1;
-                    warn!("refresh_creators_loop: {e} (attempt {consecutive_errors}, keeping previous {} creators)", last_creators);
+                    warn!(
+                        "refresh_creators_loop: {e} (attempt {consecutive_errors}, keeping previous {} creators)",
+                        last_creators
+                    );
                     // Keep previous creator list, retry after backoff
                     let backoff = std::cmp::min(60 * consecutive_errors as u64, 300);
                     tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
@@ -230,14 +349,27 @@ impl MewSnipe {
                 let mut w = self.creators.write().await;
                 *w = algo_creators;
 
-                log!(cc::LIGHT_WHITE, "Refreshed creators: {:?} | Diff: {:?}", c_len, diff);
+                log!(
+                    cc::LIGHT_WHITE,
+                    "Refreshed creators: {:?} | Diff: {:?}",
+                    c_len,
+                    diff
+                );
                 last_creators = c_len;
             }
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
     }
 
-    async fn start_session(&self, mint: Pubkey, pool: Pubkey, source: Source, disable_checks: bool, is_mtd: bool) {
+    async fn start_session(
+        &self,
+        mint: Pubkey,
+        pool: Pubkey,
+        source: Source,
+        disable_checks: bool,
+        is_mtd: bool,
+    ) {
+        self.cleanup_stale_state_if_due().await;
         if get_use_regions() {
             let is_region = match self.vacation.is_leader_active_region().await {
                 Ok(is_region) => is_region,
@@ -247,13 +379,20 @@ impl MewSnipe {
                 }
             };
             if !is_region.0 {
-                log!("Skipping session because region is not active: {:?}", is_region.1);
+                log!(
+                    "Skipping session because region is not active: {:?}",
+                    is_region.1
+                );
                 return;
             }
         }
         let max_tokens_at_once = get_max_tokens_at_once();
         if self.holdings.len() >= max_tokens_at_once as usize {
-            log!(cc::LIGHT_WHITE, "Skipping session because max tokens at once is reached: {:?}", max_tokens_at_once);
+            log!(
+                cc::LIGHT_WHITE,
+                "Skipping session because max tokens at once is reached: {:?}",
+                max_tokens_at_once
+            );
             return;
         }
         match self.holdings.entry(mint) {
@@ -262,7 +401,11 @@ impl MewSnipe {
                 return;
             }
             Entry::Vacant(v) => {
-                v.insert(Holdings { pool, buy_price: None });
+                v.insert(Holdings {
+                    pool,
+                    buy_price: None,
+                    last_seen_at: timestamp_now(),
+                });
             }
         }
 
@@ -271,11 +414,17 @@ impl MewSnipe {
             let mint_str = mint.to_string();
             let mode = get_mode();
             if mode == "sim" {
-                if let Err(e) = me.sim_session(&mint_str, &source, disable_checks, is_mtd).await {
+                if let Err(e) = me
+                    .sim_session(&mint_str, &source, disable_checks, is_mtd)
+                    .await
+                {
                     warn!("session error: {e}");
                 }
             } else if mode == "trade" {
-                if let Err(e) = me.trade_session(&mint_str, &source, disable_checks, is_mtd).await {
+                if let Err(e) = me
+                    .trade_session(&mint_str, &source, disable_checks, is_mtd)
+                    .await
+                {
                     warn!("session error: {e}");
                 }
             }
@@ -283,7 +432,13 @@ impl MewSnipe {
         });
     }
 
-    pub async fn sim_session(&self, mint: &String, source: &Source, disable_checks: bool, is_mtd: bool) -> anyhow::Result<()> {
+    pub async fn sim_session(
+        &self,
+        mint: &String,
+        source: &Source,
+        disable_checks: bool,
+        is_mtd: bool,
+    ) -> anyhow::Result<()> {
         let source = source.clone();
         log!(cc::LIGHT_WHITE, "Sim session: {:?}", source);
         let mut last_price = 0.0;
@@ -305,43 +460,86 @@ impl MewSnipe {
         let mtd_max_loss = strats_config.mtd_max_loss;
         let mtd_take_profit = strats_config.mtd_take_profit;
 
-        let max_loss = if is_mtd {mtd_max_loss} else {max_loss};
-        let take_profit = if is_mtd {mtd_take_profit} else {take_profit};
+        let max_loss = if is_mtd { mtd_max_loss } else { max_loss };
+        let take_profit = if is_mtd { mtd_take_profit } else { take_profit };
         tokio::time::sleep(std::time::Duration::from_millis(wait_time_creator_buy)).await;
 
         // pre-buy filters
         if !disable_checks && (snipe_config.use_chp || snipe_config.use_tiz) {
             log!(cc::LIGHT_WHITE, "Reading mint: {:?}", mint);
-            let mint = self.mints.read().await.get(&Pubkey::from_str(mint.clone().as_str()).unwrap()).unwrap().clone();
+            let Some(mint) = self
+                .tracked_mint_from_str(mint, "sim_session pre-buy")
+                .await
+            else {
+                return Ok(());
+            };
 
-            if snipe_config.use_tiz && mint.txns_in_zero >= tiz_lower && mint.txns_in_zero <= tiz_upper {
-                warn!("Skipping sim session because txns in slot zero aren't in range: {:?} | Possibly bundled: {}", mint.mint, mint.txns_in_zero);
+            if snipe_config.use_tiz
+                && mint.txns_in_zero >= tiz_lower
+                && mint.txns_in_zero <= tiz_upper
+            {
+                warn!(
+                    "Skipping sim session because txns in slot zero aren't in range: {:?} | Possibly bundled: {}",
+                    mint.mint, mint.txns_in_zero
+                );
                 return Ok(());
             }
 
             if snipe_config.use_chp {
-                log!(cc::LIGHT_WHITE, "Creator token amount: {:?}", mint.creator_token_amount);
+                log!(
+                    cc::LIGHT_WHITE,
+                    "Creator token amount: {:?}",
+                    mint.creator_token_amount
+                );
                 let creator_hold_percent = mint.creator_token_amount / TOTAL_SUPPLY as f64;
 
                 if creator_hold_percent > chp_lower && creator_hold_percent < chp_upper {
-                    warn!("Skipping trade session because creator hold percent is out of range: {:?}", creator_hold_percent);
+                    warn!(
+                        "Skipping trade session because creator hold percent is out of range: {:?}",
+                        creator_hold_percent
+                    );
                     return Ok(());
                 }
             }
         }
 
-        
         let snipe_time_ms = 300;
         tokio::time::sleep(std::time::Duration::from_millis(snipe_time_ms)).await;
 
         // buy
-        let mut mint = self.mints.read().await.get(&Pubkey::from_str(mint.clone().as_str()).unwrap()).unwrap().clone();
+        let Some(mut mint) = self.tracked_mint_from_str(mint, "sim_session buy").await else {
+            return Ok(());
+        };
         mint.buys += 1;
         mint.volume += buy_amount;
         let price = mint.price;
         let bc = match mint.is_migrated {
-            false => Pools { pump_fun: Some(self.pump_fun.fetch_state(&mint.bonding_curve).await.unwrap()), pump_swap: None },
-            true => Pools { pump_fun: None, pump_swap: Some(self.pump_swap.fetch_state(&mint.bonding_curve).await.unwrap()) },
+            false => match self.pump_fun.fetch_state(&mint.bonding_curve).await {
+                Ok(state) => Pools {
+                    pump_fun: Some(state),
+                    pump_swap: None,
+                },
+                Err(e) => {
+                    warn!(
+                        "sim_session: failed to fetch PumpFun state for {:?}: {e}",
+                        mint.bonding_curve
+                    );
+                    return Ok(());
+                }
+            },
+            true => match self.pump_swap.fetch_state(&mint.bonding_curve).await {
+                Ok(state) => Pools {
+                    pump_fun: None,
+                    pump_swap: Some(state),
+                },
+                Err(e) => {
+                    warn!(
+                        "sim_session: failed to fetch PumpSwap state for {:?}: {e}",
+                        mint.bonding_curve
+                    );
+                    return Ok(());
+                }
+            },
         };
 
         let mut tok_amount = self.pump_fun.lamports_to_tokens(buy_amount * 1e9, price);
@@ -354,7 +552,8 @@ impl MewSnipe {
             if net_sol_lamports > 1 {
                 let vsr_raw = bc.virtual_sol_reserves as u128;
                 let vtr_raw = bc.virtual_token_reserves as u128;
-                let tokens_out = ((net_sol_lamports - 1) * vtr_raw) / (vsr_raw + net_sol_lamports - 1);
+                let tokens_out =
+                    ((net_sol_lamports - 1) * vtr_raw) / (vsr_raw + net_sol_lamports - 1);
 
                 if tokens_out > 0 {
                     tok_amount = tokens_out as u64;
@@ -369,22 +568,41 @@ impl MewSnipe {
                     }
                 }
             }
-            log!(cc::LIGHT_WHITE, "Buying {} with {} in return for {} tokens", mint.mint, buy_amount, tok_amount as f64 / 1e6);
+            log!(
+                cc::LIGHT_WHITE,
+                "Buying {} with {} in return for {} tokens",
+                mint.mint,
+                buy_amount,
+                tok_amount as f64 / 1e6
+            );
             log!(cc::LIGHT_WHITE, "After buying, price: {}", mint.price);
         } else {
-            log!(cc::LIGHT_WHITE, "Buying {} with {} in return for {} tokens", mint.mint, buy_amount, tok_amount as f64 / 1e6);
+            log!(
+                cc::LIGHT_WHITE,
+                "Buying {} with {} in return for {} tokens",
+                mint.mint,
+                buy_amount,
+                tok_amount as f64 / 1e6
+            );
         }
+        self.touch_holding(mint.mint, Some(buy_price));
 
         // throw everything above tiz_lower and below tiz_upper txns in zero
         if snipe_config.use_tiz && !disable_checks {
             if mint.txns_in_zero >= tiz_lower && mint.txns_in_zero <= tiz_upper {
-                log!(cc::LIGHT_RED, "Selling Mint because txns in slot zero aren't in range: {:?} | Possibly bundled: {}", mint.mint, mint.txns_in_zero);
+                log!(
+                    cc::LIGHT_RED,
+                    "Selling Mint because txns in slot zero aren't in range: {:?} | Possibly bundled: {}",
+                    mint.mint,
+                    mint.txns_in_zero
+                );
                 return Ok(());
             }
         }
 
         {
             let mut map = self.mints.write().await;
+            mint.last_seen_at = timestamp_now();
             map.insert(mint.mint, mint.clone());
         }
 
@@ -396,6 +614,7 @@ impl MewSnipe {
         let mut first_creator_balance = 0.0;
 
         loop {
+            self.cleanup_stale_state_if_due().await;
             if should_sell {
                 break;
             }
@@ -410,6 +629,7 @@ impl MewSnipe {
                     }
                 }
             };
+            self.touch_holding(snapshot.mint, None);
 
             if first_creator_balance == 0.0 && snapshot.creator_token_amount > 0.0 {
                 first_creator_balance = snapshot.creator_token_amount;
@@ -421,7 +641,12 @@ impl MewSnipe {
             if profit <= -max_loss {
                 if profit_lapse.is_some() {
                     if profit_lapse.unwrap().elapsed().as_millis() > 200 {
-                        log!(cc::LIGHT_RED, "Mint sold due to loss: {:?} | Profit: {:.6}%", snapshot.mint, profit);
+                        log!(
+                            cc::LIGHT_RED,
+                            "Mint sold due to loss: {:?} | Profit: {:.6}%",
+                            snapshot.mint,
+                            profit
+                        );
                         should_sell = true;
                         profit_lapse = None;
                     }
@@ -429,15 +654,34 @@ impl MewSnipe {
                     profit_lapse = Some(Instant::now());
                 }
             } else if (take_profit > 0.0) && (profit >= take_profit) {
-                log!(cc::LIGHT_GREEN, "Mint sold due to profit: {:?} | Profit: {:.6}%", snapshot.mint, profit);
+                log!(
+                    cc::LIGHT_GREEN,
+                    "Mint sold due to profit: {:?} | Profit: {:.6}%",
+                    snapshot.mint,
+                    profit
+                );
                 should_sell = true;
             }
 
             // activity check
-            let token_stage_activity_ms = { if (snapshot.buys < 50 && profit < 10.0) || (snapshot.buys < 20) {max_na_on_start_ms} else {max_no_activity_ms} };
+            let token_stage_activity_ms = {
+                if (snapshot.buys < 50 && profit < 10.0) || (snapshot.buys < 20) {
+                    max_na_on_start_ms
+                } else {
+                    max_no_activity_ms
+                }
+            };
             let elapsed = last_update.elapsed().as_millis();
             if elapsed > token_stage_activity_ms as u128 {
-                log!(cc::LIGHT_YELLOW, "Selling Mint because of inactivity (MAX_NA_ON_START_MS: {:?}ms, MAX_NO_ACTIVITY_MS: {:?}ms) | Mint: {:?} | Last Update: {:?} | Last profit recorded: {:.6}%", max_na_on_start_ms, max_no_activity_ms, snapshot.mint, elapsed, last_profit);
+                log!(
+                    cc::LIGHT_YELLOW,
+                    "Selling Mint because of inactivity (MAX_NA_ON_START_MS: {:?}ms, MAX_NO_ACTIVITY_MS: {:?}ms) | Mint: {:?} | Last Update: {:?} | Last profit recorded: {:.6}%",
+                    max_na_on_start_ms,
+                    max_no_activity_ms,
+                    snapshot.mint,
+                    elapsed,
+                    last_profit
+                );
                 should_sell = true;
             }
 
@@ -445,7 +689,7 @@ impl MewSnipe {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 continue;
             };
-            // updates 
+            // updates
             last_update = std::time::Instant::now();
             last_price = price;
 
@@ -454,16 +698,20 @@ impl MewSnipe {
 
             {
                 if recent_profits_diffs.is_full() {
-                    let recent_profits = recent_profits_diffs.to_vec()
-                        .iter().sum::<f64>();
+                    let recent_profits = recent_profits_diffs.to_vec().iter().sum::<f64>();
                     if (recent_profits < -20.0 && profit < 100.0)
-                    || (profit >= 200.0 && highest_profit / 2.0 > profit) {
-                        log!(cc::LIGHT_RED, "Selling Mint because recent profits is too low: {:?} | Check recent profits: {:.6}%", snapshot.mint, recent_profits);
+                        || (profit >= 200.0 && highest_profit / 2.0 > profit)
+                    {
+                        log!(
+                            cc::LIGHT_RED,
+                            "Selling Mint because recent profits is too low: {:?} | Check recent profits: {:.6}%",
+                            snapshot.mint,
+                            recent_profits
+                        );
                         should_sell = true;
                     }
                 }
             }
-
 
             if profit > highest_profit {
                 highest_profit = profit;
@@ -473,7 +721,13 @@ impl MewSnipe {
 
             // dev sold check
             if snapshot.creator_sold && first_creator_balance > min_dev_sold as f64 {
-                log!(cc::LIGHT_WHITE, "Mint: {:?} | Dev Sold: {} | Profit: {:.6}%", snapshot.mint, snapshot.creator_sold, profit);
+                log!(
+                    cc::LIGHT_WHITE,
+                    "Mint: {:?} | Dev Sold: {} | Profit: {:.6}%",
+                    snapshot.mint,
+                    snapshot.creator_sold,
+                    profit
+                );
                 should_sell = true;
             }
 
@@ -517,7 +771,9 @@ impl MewSnipe {
                 highest_profit: highest_profit,
             };
 
-            if let Err(e) = self.goldmine.upsert_sim(&sim).await { warn!("upsert_sim failed: {e}"); }
+            if let Err(e) = self.goldmine.upsert_sim(&sim).await {
+                warn!("upsert_sim failed: {e}");
+            }
         }
         Ok(())
     }
@@ -539,65 +795,81 @@ impl MewSnipe {
         let tx_settings = get_tx_settings();
 
         let (ixs, fee) = match market {
-            Market::PumpSwap => self.pump_swap.buy(
-                &mint,
-                &current_pool,
-                &creator,
-                sol_amount_in,
-                slippage,
-                price,
-                use_idempotent,
-            ).await?,
-            Market::PumpFun => self.pump_fun.buy(
-                &mint,
-                &current_pool,
-                &creator,
-                sol_amount_in,
-                slippage,
-                price,
-                use_idempotent,
-            ).await?,
+            Market::PumpSwap => {
+                self.pump_swap
+                    .buy(
+                        &mint,
+                        &current_pool,
+                        &creator,
+                        sol_amount_in,
+                        slippage,
+                        price,
+                        use_idempotent,
+                    )
+                    .await?
+            }
+            Market::PumpFun => {
+                self.pump_fun
+                    .buy(
+                        &mint,
+                        &current_pool,
+                        &creator,
+                        sol_amount_in,
+                        slippage,
+                        price,
+                        use_idempotent,
+                    )
+                    .await?
+            }
         };
-        
+
         let mut tx: Result<solana_signature::Signature, anyhow::Error> = Ok(Signature::default());
         if tx_settings.tx_strat == "swqos" {
             let nb_clients = NextBlock::multiple_new(&NB_ENDPOINTS, tx_settings.nextblock_key);
             let jito_clients = &get_jito_clients();
             let helius_clients = &HeliusSender::multiple_new(&HELIUS_SENDER_ENDPOINTS);
-            let zs_clients = ZeroSlot::multiple_new(&ZERO_SLOT_ENDPOINTS, tx_settings.zero_slot_key);
-            let temporal_clients = &TemporalSender::multiple_new(&TEMPORAL_HTTP_ENDPOINTS, tx_settings.temporal_key);
+            let zs_clients =
+                ZeroSlot::multiple_new(&ZERO_SLOT_ENDPOINTS, tx_settings.zero_slot_key);
+            let temporal_clients =
+                &TemporalSender::multiple_new(&TEMPORAL_HTTP_ENDPOINTS, tx_settings.temporal_key);
             let blox_clients = Bloxroute::multiple_new(&BLOX_ENDPOINTS, tx_settings.blox_key);
             let tip_lamports = tx_settings.tip_lamports;
-            
-            let nonce_account = if get_nonce_account().is_some() && get_nonce_account().unwrap().len() > 0 {
-                Some(Pubkey::from_str(&get_nonce_account().unwrap()).unwrap())
-            } else {
-                None
-            };
 
-            tx = self.sol_hook.spray_with_all(
-                ixs, 
-                &self.pump_fun.keypair, 
-                fee, 
-                &nb_clients, 
-                jito_clients, 
-                helius_clients, 
-                &zs_clients, 
-                temporal_clients, 
-                &blox_clients, 
-                tip_lamports, 
-                None, 
-                nonce_account
-            ).await;
-        } 
-        else if tx_settings.tx_strat == "rpc" {
-            tx = self.sol_hook.send(ixs, &self.pump_fun.keypair, fee, None).await;
+            let nonce_account =
+                if get_nonce_account().is_some() && get_nonce_account().unwrap().len() > 0 {
+                    Some(Pubkey::from_str(&get_nonce_account().unwrap()).unwrap())
+                } else {
+                    None
+                };
+
+            tx = self
+                .sol_hook
+                .spray_with_all(
+                    ixs,
+                    &self.pump_fun.keypair,
+                    fee,
+                    &nb_clients,
+                    jito_clients,
+                    helius_clients,
+                    &zs_clients,
+                    temporal_clients,
+                    &blox_clients,
+                    tip_lamports,
+                    None,
+                    nonce_account,
+                )
+                .await;
+        } else if tx_settings.tx_strat == "rpc" {
+            tx = self
+                .sol_hook
+                .send(ixs, &self.pump_fun.keypair, fee, None)
+                .await;
         }
         match tx {
             Ok(sig) => {
                 log!(cc::LIGHT_WHITE, "Sig: https://solscan.io/tx/{:?}", sig);
                 return Ok((true, sig));
-            },
+            }
             Err(e) => {
                 warn!("Error sending tx: {e}");
                 return Ok((false, Signature::default()));
@@ -624,35 +896,35 @@ impl MewSnipe {
         let price = price;
 
         let (ixs, fee) = match market {
-            Market::PumpSwap => self.pump_swap.sell(
-                &mint,
-                &current_pool,
-                &creator,
-                sell_pct,
-                slippage,
-                price,
-            ).await?,
-            Market::PumpFun => self.pump_fun.sell(
-                &mint,
-                &current_pool,
-                &creator,
-                sell_pct,
-                slippage,
-                price,
-            ).await?,
+            Market::PumpSwap => {
+                self.pump_swap
+                    .sell(&mint, &current_pool, &creator, sell_pct, slippage, price)
+                    .await?
+            }
+            Market::PumpFun => {
+                self.pump_fun
+                    .sell(&mint, &current_pool, &creator, sell_pct, slippage, price)
+                    .await?
+            }
         };
-        let tx = self.sol_hook.send(ixs.clone(), &self.pump_fun.keypair, fee, None).await;
+        let tx = self
+            .sol_hook
+            .send(ixs.clone(), &self.pump_fun.keypair, fee, None)
+            .await;
         let mut tries = 0;
         match tx {
             Ok(sig) => {
                 log!(cc::LIGHT_WHITE, "Sig: https://solscan.io/tx/{:?}", sig);
                 return Ok((true, sig));
-            },
+            }
             Err(e) => {
                 warn!("Error sending tx: {e}");
                 loop {
                     if tries < retries {
-                        let tx = self.sol_hook.send(ixs.clone(), &self.pump_fun.keypair, fee, None).await;
+                        let tx = self
+                            .sol_hook
+                            .send(ixs.clone(), &self.pump_fun.keypair, fee, None)
+                            .await;
                         if tx.is_ok() {
                             return Ok((true, tx.unwrap()));
                         }
@@ -666,7 +938,13 @@ impl MewSnipe {
         }
     }
 
-    pub async fn trade_session(&self, mint: &String, source: &Source, disable_checks: bool, is_mtd: bool) -> anyhow::Result<()> {
+    pub async fn trade_session(
+        &self,
+        mint: &String,
+        source: &Source,
+        disable_checks: bool,
+        is_mtd: bool,
+    ) -> anyhow::Result<()> {
         let source = source.clone();
         log!(cc::LIGHT_WHITE, "Trade session: {:?}", source);
         let mut last_price = 0.0;
@@ -689,55 +967,116 @@ impl MewSnipe {
         let mtd_take_profit = strats_config.mtd_take_profit;
         let slippage = 1.0 + (snipe_config.slippage / 100.0);
 
-        let max_loss = if is_mtd {mtd_max_loss} else {max_loss};
-        let take_profit = if is_mtd {mtd_take_profit} else {take_profit};
+        let max_loss = if is_mtd { mtd_max_loss } else { max_loss };
+        let take_profit = if is_mtd { mtd_take_profit } else { take_profit };
         tokio::time::sleep(std::time::Duration::from_millis(wait_time_creator_buy)).await;
 
         // pre-buy filters
         if !disable_checks && (snipe_config.use_chp || snipe_config.use_tiz) {
             log!(cc::LIGHT_WHITE, "Reading mint: {:?}", mint);
-            let mint = self.mints.read().await.get(&Pubkey::from_str(mint.clone().as_str()).unwrap()).unwrap().clone();
+            let Some(mint) = self
+                .tracked_mint_from_str(mint, "trade_session pre-buy")
+                .await
+            else {
+                return Ok(());
+            };
 
-            if snipe_config.use_tiz && mint.txns_in_zero >= tiz_lower && mint.txns_in_zero <= tiz_upper {
-                warn!("Skipping trade session because txns in slot zero aren't in range: {:?} | Possibly bundled: {}", mint.mint, mint.txns_in_zero);
+            if snipe_config.use_tiz
+                && mint.txns_in_zero >= tiz_lower
+                && mint.txns_in_zero <= tiz_upper
+            {
+                warn!(
+                    "Skipping trade session because txns in slot zero aren't in range: {:?} | Possibly bundled: {}",
+                    mint.mint, mint.txns_in_zero
+                );
                 return Ok(());
             }
 
             if snipe_config.use_chp {
-                log!(cc::LIGHT_WHITE, "Creator token amount: {:?}", mint.creator_token_amount);
+                log!(
+                    cc::LIGHT_WHITE,
+                    "Creator token amount: {:?}",
+                    mint.creator_token_amount
+                );
                 let creator_hold_percent = mint.creator_token_amount / TOTAL_SUPPLY as f64;
 
                 if creator_hold_percent > chp_lower && creator_hold_percent < chp_upper {
-                    warn!("Skipping trade session because creator hold percent is out of range: {:?}", creator_hold_percent);
+                    warn!(
+                        "Skipping trade session because creator hold percent is out of range: {:?}",
+                        creator_hold_percent
+                    );
                     return Ok(());
                 }
             }
         }
 
         // buy
-        let _mint = self.mints.read().await.get(&Pubkey::from_str(mint.clone().as_str()).unwrap()).unwrap().clone();
+        let Some(_mint) = self.tracked_mint_from_str(mint, "trade_session buy").await else {
+            return Ok(());
+        };
         let price = _mint.price;
         let tok_amount = self.pump_fun.lamports_to_tokens(buy_amount * 1e9, price);
-        log!(cc::LIGHT_WHITE, "Buying {} with {} in return for {} tokens | Is migrated: {}", _mint.mint, buy_amount, tok_amount as f64 / 1e6, _mint.is_migrated);
+        log!(
+            cc::LIGHT_WHITE,
+            "Buying {} with {} in return for {} tokens | Is migrated: {}",
+            _mint.mint,
+            buy_amount,
+            tok_amount as f64 / 1e6,
+            _mint.is_migrated
+        );
 
         let market = match _mint.is_migrated {
             false => Some(Market::PumpFun),
             true => Some(Market::PumpSwap),
         };
 
-        if !self.buy(&_mint.mint.to_string(), &_mint.bonding_curve.to_string(), &_mint.creator.to_string(), buy_amount, slippage, price, Some(false), Market::PumpFun).await?.0 {
+        if !self
+            .buy(
+                &_mint.mint.to_string(),
+                &_mint.bonding_curve.to_string(),
+                &_mint.creator.to_string(),
+                buy_amount,
+                slippage,
+                price,
+                Some(false),
+                Market::PumpFun,
+            )
+            .await?
+            .0
+        {
             return Ok(());
         }
 
-        let _mint = self.mints.read().await.get(&Pubkey::from_str(mint.clone().as_str()).unwrap()).unwrap().clone();
+        let Some(_mint) = self
+            .tracked_mint_from_str(mint, "trade_session post-buy")
+            .await
+        else {
+            return Ok(());
+        };
         let price = _mint.price;
         let buy_price = price;
+        self.touch_holding(_mint.mint, Some(buy_price));
 
         // throw everything above tiz_lower and below tiz_upper txns in zero
         if snipe_config.use_tiz && !disable_checks {
             if _mint.txns_in_zero >= tiz_lower && _mint.txns_in_zero <= tiz_upper {
-                log!(cc::LIGHT_RED, "Selling Mint because txns in slot zero aren't in range: {:?} | Possibly bundled: {}", _mint.mint, _mint.txns_in_zero);
-                self.sell(&_mint.mint.to_string(), &_mint.bonding_curve.to_string(), &_mint.creator.to_string(), 100, slippage, price, market.unwrap(), 3).await?;
+                log!(
+                    cc::LIGHT_RED,
+                    "Selling Mint because txns in slot zero aren't in range: {:?} | Possibly bundled: {}",
+                    _mint.mint,
+                    _mint.txns_in_zero
+                );
+                self.sell(
+                    &_mint.mint.to_string(),
+                    &_mint.bonding_curve.to_string(),
+                    &_mint.creator.to_string(),
+                    100,
+                    slippage,
+                    price,
+                    market.unwrap(),
+                    3,
+                )
+                .await?;
                 return Ok(());
             }
         }
@@ -750,8 +1089,19 @@ impl MewSnipe {
         let mut first_creator_balance = 0.0;
 
         loop {
+            self.cleanup_stale_state_if_due().await;
             if should_sell {
-                self.sell(&_mint.mint.to_string(), &_mint.bonding_curve.to_string(), &_mint.creator.to_string(), 100, slippage, price, market.unwrap(), 3).await?;
+                self.sell(
+                    &_mint.mint.to_string(),
+                    &_mint.bonding_curve.to_string(),
+                    &_mint.creator.to_string(),
+                    100,
+                    slippage,
+                    price,
+                    market.unwrap(),
+                    3,
+                )
+                .await?;
                 break;
             }
 
@@ -765,6 +1115,7 @@ impl MewSnipe {
                     }
                 }
             };
+            self.touch_holding(snapshot.mint, None);
 
             if first_creator_balance == 0.0 && snapshot.creator_token_amount > 0.0 {
                 first_creator_balance = snapshot.creator_token_amount;
@@ -776,7 +1127,12 @@ impl MewSnipe {
             if profit <= -max_loss {
                 if profit_lapse.is_some() {
                     if profit_lapse.unwrap().elapsed().as_millis() > 200 {
-                        log!(cc::LIGHT_RED, "Mint sold due to loss: {:?} | Profit: {:.6}%", snapshot.mint, profit);
+                        log!(
+                            cc::LIGHT_RED,
+                            "Mint sold due to loss: {:?} | Profit: {:.6}%",
+                            snapshot.mint,
+                            profit
+                        );
                         should_sell = true;
                         profit_lapse = None;
                     }
@@ -784,15 +1140,34 @@ impl MewSnipe {
                     profit_lapse = Some(Instant::now());
                 }
             } else if (take_profit > 0.0) && (profit >= take_profit) {
-                log!(cc::LIGHT_GREEN, "Mint sold due to profit: {:?} | Profit: {:.6}%", snapshot.mint, profit);
+                log!(
+                    cc::LIGHT_GREEN,
+                    "Mint sold due to profit: {:?} | Profit: {:.6}%",
+                    snapshot.mint,
+                    profit
+                );
                 should_sell = true;
             }
 
             // activity check
-            let token_stage_activity_ms = { if (snapshot.buys < 50 && profit < 10.0) || (snapshot.buys < 20) {max_na_on_start_ms} else {max_no_activity_ms} };
+            let token_stage_activity_ms = {
+                if (snapshot.buys < 50 && profit < 10.0) || (snapshot.buys < 20) {
+                    max_na_on_start_ms
+                } else {
+                    max_no_activity_ms
+                }
+            };
             let elapsed = last_update.elapsed().as_millis();
             if elapsed > token_stage_activity_ms as u128 {
-                log!(cc::LIGHT_YELLOW, "Selling Mint because of inactivity (MAX_NA_ON_START_MS: {:?}ms, MAX_NO_ACTIVITY_MS: {:?}ms) | Mint: {:?} | Last Update: {:?} | Last profit recorded: {:.6}%", max_na_on_start_ms, max_no_activity_ms, snapshot.mint, elapsed, last_profit);
+                log!(
+                    cc::LIGHT_YELLOW,
+                    "Selling Mint because of inactivity (MAX_NA_ON_START_MS: {:?}ms, MAX_NO_ACTIVITY_MS: {:?}ms) | Mint: {:?} | Last Update: {:?} | Last profit recorded: {:.6}%",
+                    max_na_on_start_ms,
+                    max_no_activity_ms,
+                    snapshot.mint,
+                    elapsed,
+                    last_profit
+                );
                 should_sell = true;
             }
 
@@ -800,7 +1175,7 @@ impl MewSnipe {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 continue;
             };
-            // updates 
+            // updates
             last_update = std::time::Instant::now();
             last_price = price;
 
@@ -809,16 +1184,20 @@ impl MewSnipe {
 
             {
                 if recent_profits_diffs.is_full() {
-                    let recent_profits = recent_profits_diffs.to_vec()
-                        .iter().sum::<f64>();
+                    let recent_profits = recent_profits_diffs.to_vec().iter().sum::<f64>();
                     if (recent_profits < -20.0 && profit < 100.0)
-                    || (profit >= 200.0 && highest_profit / 2.0 > profit) {
-                        log!(cc::LIGHT_RED, "Selling Mint because recent profits is too low: {:?} | Check recent profits: {:.6}%", snapshot.mint, recent_profits);
+                        || (profit >= 200.0 && highest_profit / 2.0 > profit)
+                    {
+                        log!(
+                            cc::LIGHT_RED,
+                            "Selling Mint because recent profits is too low: {:?} | Check recent profits: {:.6}%",
+                            snapshot.mint,
+                            recent_profits
+                        );
                         should_sell = true;
                     }
                 }
             }
-
 
             if profit > highest_profit {
                 highest_profit = profit;
@@ -828,7 +1207,13 @@ impl MewSnipe {
 
             // dev sold check
             if snapshot.creator_sold && first_creator_balance > min_dev_sold as f64 {
-                log!(cc::LIGHT_WHITE, "Mint: {:?} | Dev Sold: {} | Profit: {:.6}%", snapshot.mint, snapshot.creator_sold, profit);
+                log!(
+                    cc::LIGHT_WHITE,
+                    "Mint: {:?} | Dev Sold: {} | Profit: {:.6}%",
+                    snapshot.mint,
+                    snapshot.creator_sold,
+                    profit
+                );
                 should_sell = true;
             }
 
@@ -872,11 +1257,13 @@ impl MewSnipe {
                 highest_profit: highest_profit,
             };
 
-            if let Err(e) = self.goldmine.upsert_sim(&sim).await { warn!("upsert_sim failed: {e}"); }
+            if let Err(e) = self.goldmine.upsert_sim(&sim).await {
+                warn!("upsert_sim failed: {e}");
+            }
         }
         Ok(())
     }
-    
+
     pub async fn dip_session(&self, mint: &String) -> anyhow::Result<()> {
         let mut stable_time = None;
 
@@ -890,6 +1277,7 @@ impl MewSnipe {
         let mtd_min_mc = strats_config.mtd_min_mc;
 
         loop {
+            self.cleanup_stale_state_if_due().await;
             let snapshot: MewMint = {
                 let map = self.mints.read().await;
                 match map.get(&Pubkey::from_str(mint.as_str()).unwrap()) {
@@ -911,10 +1299,22 @@ impl MewSnipe {
                 dip_lowest_price = price;
                 stable_time = Some(Instant::now());
             }
-            if recent_profits_diffs.len() == 10 && stable_time.is_some() && stable_time.unwrap().elapsed().as_secs() > mtd_stable_time as u64 {
+            if recent_profits_diffs.len() == 10
+                && stable_time.is_some()
+                && stable_time.unwrap().elapsed().as_secs() > mtd_stable_time as u64
+            {
                 let recent_profits = recent_profits_diffs.to_vec().iter().sum::<f64>();
                 if price < dip_lvl && recent_profits > 0.0 && snapshot.liquidity > mtd_min_mc {
-                    log!(cc::LIGHT_WHITE, "Mint: {:?} | Stable time: {:?} | Price: {:.10} | Dip level: {:.10} | Highest price: {:.10} | Recent profits: {:?}", mint, stable_time.unwrap().elapsed(), price, dip_lvl, highest_price, recent_profits_diffs.to_vec());
+                    log!(
+                        cc::LIGHT_WHITE,
+                        "Mint: {:?} | Stable time: {:?} | Price: {:.10} | Dip level: {:.10} | Highest price: {:.10} | Recent profits: {:?}",
+                        mint,
+                        stable_time.unwrap().elapsed(),
+                        price,
+                        dip_lvl,
+                        highest_price,
+                        recent_profits_diffs.to_vec()
+                    );
                     let me = self.clone();
                     let mint = mint.clone();
                     tokio::spawn(async move {
@@ -924,14 +1324,14 @@ impl MewSnipe {
                                 warn!("dip_session error: {e}");
                             }
                         } else if mode == "trade" {
-                            if let Err(e) = me.trade_session(&mint, &Source::Dip, true, true).await {
+                            if let Err(e) = me.trade_session(&mint, &Source::Dip, true, true).await
+                            {
                                 warn!("dip_session error: {e}");
                             }
                         }
                     });
                     break;
-                }
-                else if price < dip_lvl && price < dip_lowest_price {
+                } else if price < dip_lvl && price < dip_lowest_price {
                     dip_lowest_price = price;
                     stable_time = None;
                 }
@@ -945,7 +1345,7 @@ impl MewSnipe {
 
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
-        
+
         Ok(())
     }
 
@@ -954,10 +1354,23 @@ impl MewSnipe {
         let grpc_url = self.grpc_url.clone();
         let grpc_token = self.grpc_token.clone();
 
-        let mut grpc_client = SolHook::grpc_connect(&grpc_url, Some(&grpc_token)).await.unwrap();
+        let mut grpc_client = match SolHook::grpc_connect(&grpc_url, Some(&grpc_token)).await {
+            Ok(client) => client,
+            Err(e) => {
+                warn!("Pump.fun gRPC connect failed: {e}");
+                return Err(anyhow::anyhow!("Pump.fun gRPC connect failed: {e}"));
+            }
+        };
         let pump_address = Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap();
         let accounts = vec![pump_address];
-        let mut stream = SolHook::grpc_subscribe_transactions(&mut grpc_client, &accounts).await.unwrap();
+        let mut stream =
+            match SolHook::grpc_subscribe_transactions(&mut grpc_client, &accounts).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    warn!("Pump.fun gRPC subscribe failed: {e}");
+                    return Err(anyhow::anyhow!("Pump.fun gRPC subscribe failed: {e}"));
+                }
+            };
 
         log!(cc::LIGHT_WHITE, "Subscribed to Pump.fun using gRPC");
 
@@ -970,20 +1383,38 @@ impl MewSnipe {
         let dbf_max_chp = strats_config.dbf_max_chp;
 
         while let Some(msg) = stream.next().await {
+            self.cleanup_stale_state_if_due().await;
             let update = match msg {
                 Ok(u) => u,
-                Err(e) => { warn!("grpc error: {e}"); continue; }
+                Err(e) => {
+                    warn!("grpc error: {e}");
+                    continue;
+                }
             };
 
-            let Some(UpdateOneof::Transaction(tx_update)) = update.update_oneof else { continue };
+            let Some(UpdateOneof::Transaction(tx_update)) = update.update_oneof else {
+                continue;
+            };
 
             let Some(SubscribeUpdateTransactionInfo {
                 meta: Some(TransactionStatusMeta { log_messages, .. }),
                 ..
-            }) = tx_update.transaction.clone() else { continue };
+            }) = tx_update.transaction.clone()
+            else {
+                continue;
+            };
 
-            let sig: Vec<u8> = tx_update.transaction.clone().unwrap().signature;
-            let sig_str = SolHook::parse_signature(&sig).unwrap().to_string();
+            let Some(tx) = tx_update.transaction.as_ref() else {
+                warn!("Pump.fun gRPC update missing transaction payload");
+                continue;
+            };
+            let sig_str = match SolHook::parse_signature(&tx.signature) {
+                Ok(sig) => sig.to_string(),
+                Err(e) => {
+                    warn!("Pump.fun gRPC signature parse failed: {e}");
+                    continue;
+                }
+            };
 
             let events = PumpFun::parse_logs(log_messages.iter(), Some(&sig_str));
 
@@ -996,7 +1427,7 @@ impl MewSnipe {
                         tokio::spawn(async move {
                             // wait 2ms so create arm can index the trade
                             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-                            
+
                             let mut map = mints.write().await;
                             if let Some(mut mint) = map.get(&trade.mint).cloned() {
                                 let user = trade.user;
@@ -1009,7 +1440,7 @@ impl MewSnipe {
                                 if trade.is_buy {
                                     mint.buys += 1;
                                     mint.volume += trade.sol_amount as f64 / 1e9;
-                                } else { 
+                                } else {
                                     mint.sells += 1;
                                     mint.volume += trade.sol_amount as f64 / 1e9;
                                 }
@@ -1019,10 +1450,16 @@ impl MewSnipe {
                                     if trade.is_buy {
                                         mint.creator_token_amount += tok_amt;
                                     } else {
-                                        let dev_sell_pct =  if mint.creator_token_amount >= tok_amt && mint.creator_token_amount > 0.0 { tok_amt / mint.creator_token_amount } else { 0.0 };
+                                        let dev_sell_pct = if mint.creator_token_amount >= tok_amt
+                                            && mint.creator_token_amount > 0.0
+                                        {
+                                            tok_amt / mint.creator_token_amount
+                                        } else {
+                                            0.0
+                                        };
                                         if dev_sell_pct >= 0.5 {
                                             mint.creator_sold = true;
-                                        }    
+                                        }
                                         mint.creator_token_amount -= tok_amt;
                                         if mint.creator_token_amount <= 0.0 {
                                             mint.creator_sold = true;
@@ -1040,15 +1477,36 @@ impl MewSnipe {
                                         tokio::spawn(async move {
                                             loop {
                                                 let time = timestamp_now();
-                                                let mint = me.mints.read().await.get(&trade.mint).unwrap().clone();
-                                                if mint.created_time + 0.1 < time && time < mint.created_time + 1.0 {
-                                                    if (mint.creator_token_amount / TOTAL_SUPPLY as f64) < dbf_max_chp {
-                                                        if mint.txns_in_zero <= 1 && mint.buys <= 1 {
+                                                let Some(mint) = me
+                                                    .tracked_mint(
+                                                        &trade.mint,
+                                                        "subscribe_grpc_pump_fun dbf",
+                                                    )
+                                                    .await
+                                                else {
+                                                    break;
+                                                };
+                                                if mint.created_time + 0.1 < time
+                                                    && time < mint.created_time + 1.0
+                                                {
+                                                    if (mint.creator_token_amount
+                                                        / TOTAL_SUPPLY as f64)
+                                                        < dbf_max_chp
+                                                    {
+                                                        if mint.txns_in_zero <= 1 && mint.buys <= 1
+                                                        {
                                                             let me = me.clone();
                                                             let mint_pk = mint.mint;
                                                             let pool = mint.bonding_curve;
                                                             tokio::spawn(async move {
-                                                                me.start_session(mint_pk, pool, Source::DevBestFriend, true, false).await;
+                                                                me.start_session(
+                                                                    mint_pk,
+                                                                    pool,
+                                                                    Source::DevBestFriend,
+                                                                    true,
+                                                                    false,
+                                                                )
+                                                                .await;
                                                             });
                                                             break;
                                                         }
@@ -1057,7 +1515,10 @@ impl MewSnipe {
                                                 if time > mint.created_time + 1.0 {
                                                     break;
                                                 }
-                                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                                tokio::time::sleep(
+                                                    std::time::Duration::from_millis(10),
+                                                )
+                                                .await;
                                             }
                                         });
                                     }
@@ -1070,12 +1531,21 @@ impl MewSnipe {
                                             mint.txns_in_n += 1;
                                             mint.volume_in_n += trade.sol_amount as f64 / 1e9;
                                             //log!(cc::LIGHT_WHITE, "Mint: {:?} | User: {:?} | Txns in n: {:?}", mint.mint, user, mint.txns_in_n);
-                                            if mint.txns_in_n >= abs_min_buys || mint.volume_in_n >= abs_min_volume {
+                                            if mint.txns_in_n >= abs_min_buys
+                                                || mint.volume_in_n >= abs_min_volume
+                                            {
                                                 let me = me.clone();
                                                 let mint_pk = mint.mint;
                                                 let pool = mint.bonding_curve;
                                                 tokio::spawn(async move {
-                                                    me.start_session(mint_pk, pool, Source::Digged, true, false).await;
+                                                    me.start_session(
+                                                        mint_pk,
+                                                        pool,
+                                                        Source::Digged,
+                                                        true,
+                                                        false,
+                                                    )
+                                                    .await;
                                                 });
                                             }
                                         }
@@ -1083,11 +1553,12 @@ impl MewSnipe {
                                 }
                                 mint.price = price;
                                 mint.last_seen_slot = tx_update.slot;
+                                mint.last_seen_at = timestamp_now();
                                 mint.liquidity = trade.real_sol_reserves as f64 / 1e9;
                                 map.insert(trade.mint, mint);
                             }
                         })
-                    },
+                    }
 
                     PumpFunEvent::Create(Some(create)) => {
                         let mints = Arc::clone(&self.mints);
@@ -1106,10 +1577,16 @@ impl MewSnipe {
                             let created_time = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .expect("Time error.");
-                            let ts: f64 = created_time.as_secs() as f64 + f64::from(created_time.subsec_nanos()) * 1e-9;
+                            let ts: f64 = created_time.as_secs() as f64
+                                + f64::from(created_time.subsec_nanos()) * 1e-9;
 
                             let price = PumpFun::get_open_price(&create);
-                            log!(cc::LIGHT_GRAY, "Mint: {:?} at slot: {:?}", create.mint, tx_update.slot);
+                            log!(
+                                cc::LIGHT_GRAY,
+                                "Mint: {:?} at slot: {:?}",
+                                create.mint,
+                                tx_update.slot
+                            );
                             let new_mint = MewMint {
                                 mint: create.mint,
                                 bonding_curve: create.bonding_curve,
@@ -1129,6 +1606,7 @@ impl MewSnipe {
                                 volume_in_n: 0.0,
                                 first_seen_slot: tx_update.slot,
                                 last_seen_slot: tx_update.slot,
+                                last_seen_at: ts,
                                 liquidity: 0.0,
                                 is_migrated: false,
                                 created_time: ts,
@@ -1137,7 +1615,12 @@ impl MewSnipe {
                             let mut map = mints.write().await;
                             map.insert(create.mint, new_mint.clone());
 
-                            if goldmine.get_dupes(&name, &symbol, &uri).await.unwrap_or(None).is_some() {
+                            if goldmine
+                                .get_dupes(&name, &symbol, &uri)
+                                .await
+                                .unwrap_or(None)
+                                .is_some()
+                            {
                                 return;
                             }
                             // TODO: Uncomment this when we have a way to blacklist creators
@@ -1145,9 +1628,10 @@ impl MewSnipe {
                             //     return;
                             // }
 
-                            if let Some((_, creator_source)) = creators
-                                .iter()
-                                .find(|(c, source)| matches_tracked_creator(c, source, &creator_str, &user_str))
+                            if let Some((_, creator_source)) =
+                                creators.iter().find(|(c, source)| {
+                                    matches_tracked_creator(c, source, &creator_str, &user_str)
+                                })
                             {
                                 log!(
                                     cc::LIGHT_WHITE,
@@ -1160,7 +1644,14 @@ impl MewSnipe {
 
                                 let me = me.clone();
                                 tokio::spawn(async move {
-                                    me.start_session(new_mint.mint, new_mint.bonding_curve, src, false, false).await;
+                                    me.start_session(
+                                        new_mint.mint,
+                                        new_mint.bonding_curve,
+                                        src,
+                                        false,
+                                        false,
+                                    )
+                                    .await;
                                 });
                             }
 
@@ -1218,8 +1709,10 @@ impl MewSnipe {
                             //     });
                             // }
                         })
-                    },
-                    _ => { tokio::spawn(async move { return; }) },
+                    }
+                    _ => tokio::spawn(async move {
+                        return;
+                    }),
                 };
             }
         }
@@ -1230,9 +1723,23 @@ impl MewSnipe {
         // let buy_amount = config().buy_amount;
         let ws_url = config().ws_url.clone();
 
-        let (mut rx, _handle) = match self.sol_hook.subscribe_logs_channel(&ws_url, RpcTransactionLogsFilter::Mentions(vec![Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap().to_string()]), CommitmentConfig::processed()).await {
+        let (mut rx, _handle) = match self
+            .sol_hook
+            .subscribe_logs_channel(
+                &ws_url,
+                RpcTransactionLogsFilter::Mentions(vec![
+                    Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+                        .unwrap()
+                        .to_string(),
+                ]),
+                CommitmentConfig::processed(),
+            )
+            .await
+        {
             Ok(r) => r,
-            Err(e) => { anyhow::bail!("PumpFun WS subscribe failed: {e}"); }
+            Err(e) => {
+                anyhow::bail!("PumpFun WS subscribe failed: {e}");
+            }
         };
         log!(cc::LIGHT_WHITE, "Subscribed to Pump.fun using WS");
 
@@ -1246,7 +1753,19 @@ impl MewSnipe {
 
         while let Some(msg) = rx.recv().await {
             let sig = msg.signature.clone();
-            let slot = self.sol_hook.rpc_client.get_slot_with_commitment(CommitmentConfig::processed()).await.unwrap();
+            self.cleanup_stale_state_if_due().await;
+            let slot = match self
+                .sol_hook
+                .rpc_client
+                .get_slot_with_commitment(CommitmentConfig::processed())
+                .await
+            {
+                Ok(slot) => slot,
+                Err(e) => {
+                    warn!("Pump.fun WS slot fetch failed: {e}");
+                    continue;
+                }
+            };
             let events = PumpFun::parse_logs(msg.logs.iter(), Some(&sig));
 
             for event in events {
@@ -1258,7 +1777,7 @@ impl MewSnipe {
                         tokio::spawn(async move {
                             // wait 2ms so create arm can index the trade
                             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-                            
+
                             let mut map = mints.write().await;
                             if let Some(mut mint) = map.get(&trade.mint).cloned() {
                                 let user = trade.user;
@@ -1271,7 +1790,7 @@ impl MewSnipe {
                                 if trade.is_buy {
                                     mint.buys += 1;
                                     mint.volume += trade.sol_amount as f64 / 1e9;
-                                } else { 
+                                } else {
                                     mint.sells += 1;
                                     mint.volume += trade.sol_amount as f64 / 1e9;
                                 }
@@ -1281,10 +1800,16 @@ impl MewSnipe {
                                     if trade.is_buy {
                                         mint.creator_token_amount += tok_amt;
                                     } else {
-                                        let dev_sell_pct =  if mint.creator_token_amount >= tok_amt && mint.creator_token_amount > 0.0 { tok_amt / mint.creator_token_amount } else { 0.0 };
+                                        let dev_sell_pct = if mint.creator_token_amount >= tok_amt
+                                            && mint.creator_token_amount > 0.0
+                                        {
+                                            tok_amt / mint.creator_token_amount
+                                        } else {
+                                            0.0
+                                        };
                                         if dev_sell_pct >= 0.5 {
                                             mint.creator_sold = true;
-                                        }    
+                                        }
                                         mint.creator_token_amount -= tok_amt;
                                         if mint.creator_token_amount <= 0.0 {
                                             mint.creator_sold = true;
@@ -1302,15 +1827,36 @@ impl MewSnipe {
                                         tokio::spawn(async move {
                                             loop {
                                                 let time = timestamp_now();
-                                                let mint = me.mints.read().await.get(&trade.mint).unwrap().clone();
-                                                if mint.created_time + 0.1 < time && time < mint.created_time + 1.0 {
-                                                    if (mint.creator_token_amount / TOTAL_SUPPLY as f64) < dbf_max_chp {
-                                                        if mint.txns_in_zero <= 1 && mint.buys <= 1 {
+                                                let Some(mint) = me
+                                                    .tracked_mint(
+                                                        &trade.mint,
+                                                        "subscribe_ws_pump_fun dbf",
+                                                    )
+                                                    .await
+                                                else {
+                                                    break;
+                                                };
+                                                if mint.created_time + 0.1 < time
+                                                    && time < mint.created_time + 1.0
+                                                {
+                                                    if (mint.creator_token_amount
+                                                        / TOTAL_SUPPLY as f64)
+                                                        < dbf_max_chp
+                                                    {
+                                                        if mint.txns_in_zero <= 1 && mint.buys <= 1
+                                                        {
                                                             let me = me.clone();
                                                             let mint_pk = mint.mint;
                                                             let pool = mint.bonding_curve;
                                                             tokio::spawn(async move {
-                                                                me.start_session(mint_pk, pool, Source::DevBestFriend, true, false).await;
+                                                                me.start_session(
+                                                                    mint_pk,
+                                                                    pool,
+                                                                    Source::DevBestFriend,
+                                                                    true,
+                                                                    false,
+                                                                )
+                                                                .await;
                                                             });
                                                             break;
                                                         }
@@ -1319,7 +1865,10 @@ impl MewSnipe {
                                                 if time > mint.created_time + 1.0 {
                                                     break;
                                                 }
-                                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                                tokio::time::sleep(
+                                                    std::time::Duration::from_millis(10),
+                                                )
+                                                .await;
                                             }
                                         });
                                     }
@@ -1332,12 +1881,21 @@ impl MewSnipe {
                                             mint.txns_in_n += 1;
                                             mint.volume_in_n += trade.sol_amount as f64 / 1e9;
                                             //log!(cc::LIGHT_WHITE, "Mint: {:?} | User: {:?} | Txns in n: {:?}", mint.mint, user, mint.txns_in_n);
-                                            if mint.txns_in_n >= abs_min_buys || mint.volume_in_n >= abs_min_volume {
+                                            if mint.txns_in_n >= abs_min_buys
+                                                || mint.volume_in_n >= abs_min_volume
+                                            {
                                                 let me = me.clone();
                                                 let mint_pk = mint.mint;
                                                 let pool = mint.bonding_curve;
                                                 tokio::spawn(async move {
-                                                    me.start_session(mint_pk, pool, Source::Digged, true, false).await;
+                                                    me.start_session(
+                                                        mint_pk,
+                                                        pool,
+                                                        Source::Digged,
+                                                        true,
+                                                        false,
+                                                    )
+                                                    .await;
                                                 });
                                             }
                                         }
@@ -1345,11 +1903,12 @@ impl MewSnipe {
                                 }
                                 mint.price = price;
                                 mint.last_seen_slot = slot;
+                                mint.last_seen_at = timestamp_now();
                                 mint.liquidity = trade.real_sol_reserves as f64 / 1e9;
                                 map.insert(trade.mint, mint);
                             }
                         })
-                    },
+                    }
 
                     PumpFunEvent::Create(Some(create)) => {
                         let mints = Arc::clone(&self.mints);
@@ -1368,10 +1927,16 @@ impl MewSnipe {
                             let created_time = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .expect("Time error.");
-                            let ts: f64 = created_time.as_secs() as f64 + f64::from(created_time.subsec_nanos()) * 1e-9;
+                            let ts: f64 = created_time.as_secs() as f64
+                                + f64::from(created_time.subsec_nanos()) * 1e-9;
 
                             let price = PumpFun::get_open_price(&create);
-                            log!(cc::LIGHT_GRAY, "Mint: {:?} at slot: {:?}", create.mint, slot);
+                            log!(
+                                cc::LIGHT_GRAY,
+                                "Mint: {:?} at slot: {:?}",
+                                create.mint,
+                                slot
+                            );
                             let new_mint = MewMint {
                                 mint: create.mint,
                                 bonding_curve: create.bonding_curve,
@@ -1391,6 +1956,7 @@ impl MewSnipe {
                                 volume_in_n: 0.0,
                                 first_seen_slot: slot,
                                 last_seen_slot: slot,
+                                last_seen_at: ts,
                                 liquidity: 0.0,
                                 is_migrated: false,
                                 created_time: ts,
@@ -1399,7 +1965,12 @@ impl MewSnipe {
                             let mut map = mints.write().await;
                             map.insert(create.mint, new_mint.clone());
 
-                            if goldmine.get_dupes(&name, &symbol, &uri).await.unwrap_or(None).is_some() {
+                            if goldmine
+                                .get_dupes(&name, &symbol, &uri)
+                                .await
+                                .unwrap_or(None)
+                                .is_some()
+                            {
                                 return;
                             }
                             // TODO: Uncomment this when we have a way to blacklist creators
@@ -1407,9 +1978,10 @@ impl MewSnipe {
                             //     return;
                             // }
 
-                            if let Some((_, creator_source)) = creators
-                                .iter()
-                                .find(|(c, source)| matches_tracked_creator(c, source, &creator_str, &user_str))
+                            if let Some((_, creator_source)) =
+                                creators.iter().find(|(c, source)| {
+                                    matches_tracked_creator(c, source, &creator_str, &user_str)
+                                })
                             {
                                 log!(
                                     cc::LIGHT_WHITE,
@@ -1422,7 +1994,14 @@ impl MewSnipe {
 
                                 let me = me.clone();
                                 tokio::spawn(async move {
-                                    me.start_session(new_mint.mint, new_mint.bonding_curve, src, false, false).await;
+                                    me.start_session(
+                                        new_mint.mint,
+                                        new_mint.bonding_curve,
+                                        src,
+                                        false,
+                                        false,
+                                    )
+                                    .await;
                                 });
                             }
 
@@ -1480,8 +2059,10 @@ impl MewSnipe {
                             //     });
                             // }
                         })
-                    },
-                    _ => { tokio::spawn(async move { return; }) },
+                    }
+                    _ => tokio::spawn(async move {
+                        return;
+                    }),
                 };
             }
         }
@@ -1493,28 +2074,59 @@ impl MewSnipe {
         let grpc_url = self.grpc_url.clone();
         let grpc_token = self.grpc_token.clone();
 
-        let mut grpc_client = SolHook::grpc_connect(&grpc_url, Some(&grpc_token)).await.unwrap();
+        let mut grpc_client = match SolHook::grpc_connect(&grpc_url, Some(&grpc_token)).await {
+            Ok(client) => client,
+            Err(e) => {
+                warn!("PumpSwap gRPC connect failed: {e}");
+                return Err(anyhow::anyhow!("PumpSwap gRPC connect failed: {e}"));
+            }
+        };
         let pump_address = Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").unwrap();
         let accounts = vec![pump_address];
-        let mut stream = SolHook::grpc_subscribe_transactions(&mut grpc_client, &accounts).await.unwrap();
+        let mut stream =
+            match SolHook::grpc_subscribe_transactions(&mut grpc_client, &accounts).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    warn!("PumpSwap gRPC subscribe failed: {e}");
+                    return Err(anyhow::anyhow!("PumpSwap gRPC subscribe failed: {e}"));
+                }
+            };
 
         log!(cc::LIGHT_WHITE, "Subscribed to PumpSwap using gRPC");
 
         while let Some(msg) = stream.next().await {
+            self.cleanup_stale_state_if_due().await;
             let update = match msg {
                 Ok(u) => u,
-                Err(e) => { warn!("grpc error: {e}"); continue; }
+                Err(e) => {
+                    warn!("grpc error: {e}");
+                    continue;
+                }
             };
 
-            let Some(UpdateOneof::Transaction(tx_update)) = update.update_oneof else { continue };
+            let Some(UpdateOneof::Transaction(tx_update)) = update.update_oneof else {
+                continue;
+            };
 
             let Some(SubscribeUpdateTransactionInfo {
                 meta: Some(TransactionStatusMeta { log_messages, .. }),
                 ..
-            }) = tx_update.transaction.clone() else { continue };
+            }) = tx_update.transaction.clone()
+            else {
+                continue;
+            };
 
-            let sig: Vec<u8> = tx_update.transaction.clone().unwrap().signature;
-            let sig_str = SolHook::parse_signature(&sig).unwrap().to_string();
+            let Some(tx) = tx_update.transaction.as_ref() else {
+                warn!("PumpSwap gRPC update missing transaction payload");
+                continue;
+            };
+            let sig_str = match SolHook::parse_signature(&tx.signature) {
+                Ok(sig) => sig.to_string(),
+                Err(e) => {
+                    warn!("PumpSwap gRPC signature parse failed: {e}");
+                    continue;
+                }
+            };
 
             let events = PumpSwap::parse_logs(log_messages.iter(), Some(&sig_str));
 
@@ -1528,13 +2140,31 @@ impl MewSnipe {
                                 continue;
                             }
                             // log!(cc::LIGHT_WHITE, "Create pool: {:?}", create);
-                            if me.holdings.contains_key(&create.base_mint) && create.quote_mint == WSOL_MINT {
-                                log!(cc::LIGHT_WHITE, "Token from holdings has migrated! {:?}", create.base_mint);
-                                let mut mew_mint = me.mints.read().await.get(&Pubkey::from_str(create.base_mint.clone().to_string().as_str()).unwrap()).unwrap().clone();
+                            if me.holdings.contains_key(&create.base_mint)
+                                && create.quote_mint == WSOL_MINT
+                            {
+                                log!(
+                                    cc::LIGHT_WHITE,
+                                    "Token from holdings has migrated! {:?}",
+                                    create.base_mint
+                                );
+                                let Some(mut mew_mint) = me
+                                    .tracked_mint(
+                                        &create.base_mint,
+                                        "subscribe_grpc_pump_swap migrate",
+                                    )
+                                    .await
+                                else {
+                                    continue;
+                                };
                                 mew_mint.is_migrated = true;
+                                mew_mint.last_seen_at = timestamp_now();
                                 me.mints.write().await.insert(create.base_mint, mew_mint);
                             }
-                            if create.quote_mint == WSOL_MINT && create.quote_amount_in >= 83990359346 && create.base_amount_in == 206900000000000 {
+                            if create.quote_mint == WSOL_MINT
+                                && create.quote_amount_in >= 83990359346
+                                && create.base_amount_in == 206900000000000
+                            {
                                 let price = PumpSwap::price_from_create(&create);
                                 let mint = MewMint {
                                     mint: create.base_mint,
@@ -1556,10 +2186,16 @@ impl MewSnipe {
                                     volume_in_n: 0.0,
                                     first_seen_slot: tx_update.slot,
                                     last_seen_slot: tx_update.slot,
+                                    last_seen_at: timestamp_now(),
                                     is_migrated: true,
                                     created_time: timestamp_now(),
                                 };
-                                log!(cc::LIGHT_WHITE, "Tracking dip: {:?} | Base mint: {:?}", create.pool, create.base_mint);
+                                log!(
+                                    cc::LIGHT_WHITE,
+                                    "Tracking dip: {:?} | Base mint: {:?}",
+                                    create.pool,
+                                    create.base_mint
+                                );
                                 let mew = me.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = mew.dip_session(&mint.mint.to_string()).await {
@@ -1593,6 +2229,7 @@ impl MewSnipe {
                             }
                             mew_mint.price = price;
                             mew_mint.last_seen_slot = tx_update.slot;
+                            mew_mint.last_seen_at = timestamp_now();
                             mew_mint.liquidity = buy.pool_quote_token_reserves as f64 / 1e9;
                             me.mints.write().await.insert(mew_mint.mint, mew_mint);
                         }
@@ -1613,10 +2250,16 @@ impl MewSnipe {
 
                             let tok_amt = sell.base_amount_in as f64 / 1e6;
                             if user == creator {
-                                let dev_sell_pct =  if mew_mint.creator_token_amount >= tok_amt && mew_mint.creator_token_amount > 0.0 { tok_amt / mew_mint.creator_token_amount } else { 0.0 };
+                                let dev_sell_pct = if mew_mint.creator_token_amount >= tok_amt
+                                    && mew_mint.creator_token_amount > 0.0
+                                {
+                                    tok_amt / mew_mint.creator_token_amount
+                                } else {
+                                    0.0
+                                };
                                 if dev_sell_pct >= 0.5 {
                                     mew_mint.creator_sold = true;
-                                }    
+                                }
                                 mew_mint.creator_token_amount -= tok_amt;
                                 if mew_mint.creator_token_amount <= 0.0 {
                                     mew_mint.creator_sold = true;
@@ -1624,6 +2267,7 @@ impl MewSnipe {
                             }
                             mew_mint.price = price;
                             mew_mint.last_seen_slot = tx_update.slot;
+                            mew_mint.last_seen_at = timestamp_now();
                             mew_mint.liquidity = sell.pool_quote_token_reserves as f64 / 1e9;
                             me.mints.write().await.insert(mew_mint.mint, mew_mint);
                         }
@@ -1639,15 +2283,41 @@ impl MewSnipe {
         // let buy_amount = config().buy_amount;
         let ws_url = config().ws_url.clone();
 
-        let (mut rx, _handle) = match self.sol_hook.subscribe_logs_channel(&ws_url, RpcTransactionLogsFilter::Mentions(vec![Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").unwrap().to_string()]), CommitmentConfig::processed()).await {
+        let (mut rx, _handle) = match self
+            .sol_hook
+            .subscribe_logs_channel(
+                &ws_url,
+                RpcTransactionLogsFilter::Mentions(vec![
+                    Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA")
+                        .unwrap()
+                        .to_string(),
+                ]),
+                CommitmentConfig::processed(),
+            )
+            .await
+        {
             Ok(r) => r,
-            Err(e) => { anyhow::bail!("PumpSwap WS subscribe failed: {e}"); }
+            Err(e) => {
+                anyhow::bail!("PumpSwap WS subscribe failed: {e}");
+            }
         };
         log!(cc::LIGHT_WHITE, "Subscribed to PumpSwap using WS");
 
         while let Some(msg) = rx.recv().await {
             let sig = msg.signature.clone();
-            let slot = self.sol_hook.rpc_client.get_slot_with_commitment(CommitmentConfig::processed()).await.unwrap();
+            self.cleanup_stale_state_if_due().await;
+            let slot = match self
+                .sol_hook
+                .rpc_client
+                .get_slot_with_commitment(CommitmentConfig::processed())
+                .await
+            {
+                Ok(slot) => slot,
+                Err(e) => {
+                    warn!("PumpSwap WS slot fetch failed: {e}");
+                    continue;
+                }
+            };
 
             let events = PumpSwap::parse_logs(msg.logs.iter(), Some(&sig));
 
@@ -1661,13 +2331,31 @@ impl MewSnipe {
                                 continue;
                             }
                             // log!(cc::LIGHT_WHITE, "Create pool: {:?}", create);
-                            if me.holdings.contains_key(&create.base_mint) && create.quote_mint == WSOL_MINT {
-                                log!(cc::LIGHT_WHITE, "Token from holdings has migrated! {:?}", create.base_mint);
-                                let mut mew_mint = me.mints.read().await.get(&Pubkey::from_str(create.base_mint.clone().to_string().as_str()).unwrap()).unwrap().clone();
+                            if me.holdings.contains_key(&create.base_mint)
+                                && create.quote_mint == WSOL_MINT
+                            {
+                                log!(
+                                    cc::LIGHT_WHITE,
+                                    "Token from holdings has migrated! {:?}",
+                                    create.base_mint
+                                );
+                                let Some(mut mew_mint) = me
+                                    .tracked_mint(
+                                        &create.base_mint,
+                                        "subscribe_ws_pump_swap migrate",
+                                    )
+                                    .await
+                                else {
+                                    continue;
+                                };
                                 mew_mint.is_migrated = true;
+                                mew_mint.last_seen_at = timestamp_now();
                                 me.mints.write().await.insert(create.base_mint, mew_mint);
                             }
-                            if create.quote_mint == WSOL_MINT && create.quote_amount_in >= 83990359346 && create.base_amount_in == 206900000000000 {
+                            if create.quote_mint == WSOL_MINT
+                                && create.quote_amount_in >= 83990359346
+                                && create.base_amount_in == 206900000000000
+                            {
                                 let price = PumpSwap::price_from_create(&create);
                                 let mint = MewMint {
                                     mint: create.base_mint,
@@ -1689,10 +2377,16 @@ impl MewSnipe {
                                     volume_in_n: 0.0,
                                     first_seen_slot: slot,
                                     last_seen_slot: slot,
+                                    last_seen_at: timestamp_now(),
                                     is_migrated: true,
                                     created_time: timestamp_now(),
                                 };
-                                log!(cc::LIGHT_WHITE, "Tracking dip: {:?} | Base mint: {:?}", create.pool, create.base_mint);
+                                log!(
+                                    cc::LIGHT_WHITE,
+                                    "Tracking dip: {:?} | Base mint: {:?}",
+                                    create.pool,
+                                    create.base_mint
+                                );
                                 let mew = me.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = mew.dip_session(&mint.mint.to_string()).await {
@@ -1726,6 +2420,7 @@ impl MewSnipe {
                             }
                             mew_mint.price = price;
                             mew_mint.last_seen_slot = slot;
+                            mew_mint.last_seen_at = timestamp_now();
                             mew_mint.liquidity = buy.pool_quote_token_reserves as f64 / 1e9;
                             me.mints.write().await.insert(mew_mint.mint, mew_mint);
                         }
@@ -1746,10 +2441,16 @@ impl MewSnipe {
 
                             let tok_amt = sell.base_amount_in as f64 / 1e6;
                             if user == creator {
-                                let dev_sell_pct =  if mew_mint.creator_token_amount >= tok_amt && mew_mint.creator_token_amount > 0.0 { tok_amt / mew_mint.creator_token_amount } else { 0.0 };
+                                let dev_sell_pct = if mew_mint.creator_token_amount >= tok_amt
+                                    && mew_mint.creator_token_amount > 0.0
+                                {
+                                    tok_amt / mew_mint.creator_token_amount
+                                } else {
+                                    0.0
+                                };
                                 if dev_sell_pct >= 0.5 {
                                     mew_mint.creator_sold = true;
-                                }    
+                                }
                                 mew_mint.creator_token_amount -= tok_amt;
                                 if mew_mint.creator_token_amount <= 0.0 {
                                     mew_mint.creator_sold = true;
@@ -1757,6 +2458,7 @@ impl MewSnipe {
                             }
                             mew_mint.price = price;
                             mew_mint.last_seen_slot = slot;
+                            mew_mint.last_seen_at = timestamp_now();
                             mew_mint.liquidity = sell.pool_quote_token_reserves as f64 / 1e9;
                             me.mints.write().await.insert(mew_mint.mint, mew_mint);
                         }
